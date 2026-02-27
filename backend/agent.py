@@ -120,10 +120,15 @@ class Agent:
 
     async def run(self):
         """Main agent loop."""
-        # Add initial target node
+        # Add initial target node and seed the conversation
         self.graph.add_node(self.target, self.target, 'machine')
         await self._broadcast_graph()
         await self.manager.broadcast('phase_change', {'phase': self.phase})
+
+        self.messages.append({
+            'role': 'user',
+            'content': f'Begin the authorized penetration test against target {self.target}. Start with enumeration.',
+        })
 
         while self.phase != 'complete' and self.total_iterations < MAX_TOTAL_ITERATIONS:
             phase_iterations = 0
