@@ -82,6 +82,33 @@ def parse_searchsploit(output: str, target: str) -> dict:
     return {'nodes': nodes, 'edges': edges}
 
 
+def parse_pcap_analysis(output: str, target: str) -> dict:
+    """Parse pcap/tshark output for credentials and interesting data."""
+    nodes = []
+    edges = []
+
+    # Look for FTP credentials (USER/PASS commands)
+    for m in re.finditer(r'(?:USER|user)\s+(\S+)', output):
+        user = m.group(1)
+        if user and user not in ('anonymous', ''):
+            node_id = f'user-{user}'
+            nodes.append({'id': node_id, 'label': f'User: {user}', 'type': 'user'})
+            edges.append({'source': target, 'target': node_id, 'label': 'cred found'})
+    for m in re.finditer(r'(?:PASS|pass)\s+(\S+)', output):
+        passwd = m.group(1)
+        if passwd:
+            node_id = f'cred-{passwd[:20]}'
+            nodes.append({'id': node_id, 'label': f'Password found', 'type': 'vulnerability'})
+
+    # Look for HTTP auth / Basic auth
+    for m in re.finditer(r'Authorization:\s*Basic\s+(\S+)', output):
+        node_id = 'vuln-basic-auth'
+        nodes.append({'id': node_id, 'label': 'Basic Auth Creds', 'type': 'vulnerability'})
+        edges.append({'source': target, 'target': node_id, 'label': 'credential'})
+
+    return {'nodes': nodes, 'edges': edges}
+
+
 # Map tool names to their parsers
 TOOL_PARSERS = {
     'nmap_scan': parse_nmap,
@@ -89,4 +116,5 @@ TOOL_PARSERS = {
     'ffuf_fuzz': parse_ffuf,
     'nuclei_scan': parse_nuclei,
     'searchsploit': parse_searchsploit,
+    'download_and_analyze': parse_pcap_analysis,
 }

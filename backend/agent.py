@@ -1,6 +1,9 @@
 import json
 import time
+import sys
+import io
 from pathlib import Path
+from datetime import datetime
 
 from backend.llm import get_client, chat_completion
 from backend.graph import GraphManager
@@ -10,6 +13,7 @@ from backend.tools import TOOL_REGISTRY, get_tools_for_phase
 from backend.parsers import TOOL_PARSERS
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
 PHASES = ['enumeration', 'vuln_analysis', 'exploitation', 'privesc']
 MAX_ITERATIONS_PER_PHASE = 15
@@ -56,6 +60,15 @@ ARG_ALIASES = {
     # url aliases
     'target_url': 'url',
     'site': 'url',
+    # report aliases
+    'content': 'markdown',
+    'text': 'markdown',
+    'body': 'markdown',
+    # filename aliases
+    'file': 'filename',
+    'name': 'filename',
+    'output': 'filename',
+    'file_name': 'filename',
 }
 
 # Meta-tool schemas (transition_phase and append_report only — graph is auto-updated)
@@ -103,8 +116,37 @@ def load_prompt(filename: str) -> str:
     return ""
 
 
-def log(msg: str):
-    print(f"{C_DIM}[{time.strftime('%H:%M:%S')}]{C_RESET} {msg}")
+class SessionLogger:
+    """Tees all output to both terminal and a log file."""
+
+    def __init__(self, target: str):
+        LOGS_DIR.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_target = target.replace('.', '_').replace(':', '_')
+        self.log_path = LOGS_DIR / f'{timestamp}_{safe_target}.log'
+        self.log_file = open(self.log_path, 'w')
+
+    def log(self, msg: str):
+        """Print to terminal with colors and write plain text to log file."""
+        timestamp = time.strftime('%H:%M:%S')
+        colored = f"{C_DIM}[{timestamp}]{C_RESET} {msg}"
+        print(colored)
+        # Strip ANSI for log file
+        import re
+        plain = re.sub(r'\033\[[0-9;]*m', '', f'[{timestamp}] {msg}')
+        self.log_file.write(plain + '\n')
+        self.log_file.flush()
+
+    def header(self, msg: str):
+        """Print a header line."""
+        print(msg)
+        import re
+        plain = re.sub(r'\033\[[0-9;]*m', '', msg)
+        self.log_file.write(plain + '\n')
+        self.log_file.flush()
+
+    def close(self):
+        self.log_file.close()
 
 
 def normalize_args(name: str, args: dict) -> dict:
@@ -114,14 +156,14 @@ def normalize_args(name: str, args: dict) -> dict:
         canonical = ARG_ALIASES.get(key, key)
         normalized[canonical] = value
 
-    # If tool expects 'target' and we have it nowhere, check if it's in the tool registry
-    if name in TOOL_REGISTRY:
-        schema_props = TOOL_REGISTRY[name]['parameters'].get('properties', {})
-        for expected_key in schema_props:
-            if expected_key not in normalized:
-                # Check if any value in normalized could be the target
-                # e.g. model sent {"host": "10.10.10.1"} -> already handled by aliases
-                pass
+    # For append_report: combine title + markdown if both present
+    if name == 'append_report' and 'title' in args:
+        title = args.get('title', '')
+        md = normalized.get('markdown', '')
+        if title and md:
+            normalized['markdown'] = f"## {title}\n\n{md}"
+        elif title and not md:
+            normalized['markdown'] = f"## {title}"
 
     return normalized
 
@@ -138,6 +180,7 @@ class Agent:
         self.total_iterations = 0
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self.logger = SessionLogger(target)
 
     def _build_system_prompt(self) -> str:
         system = load_prompt("system.md")
@@ -151,10 +194,13 @@ class Agent:
 
     async def run(self):
         """Main agent loop."""
-        print(f"\n{C_BOLD}{C_BLUE}{'='*60}{C_RESET}")
-        print(f"{C_BOLD}{C_BLUE}  LACUNA — Security Research Agent{C_RESET}")
-        print(f"{C_BOLD}{C_BLUE}  Target: {self.target}{C_RESET}")
-        print(f"{C_BOLD}{C_BLUE}{'='*60}{C_RESET}\n")
+        L = self.logger
+
+        L.header(f"\n{C_BOLD}{C_BLUE}{'='*60}{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  LACUNA — Security Research Agent{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Target: {self.target}{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Log: {L.log_path}{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}{'='*60}{C_RESET}\n")
 
         # Add initial target node and seed the conversation
         self.graph.add_node(self.target, self.target, 'machine')
@@ -166,7 +212,7 @@ class Agent:
             'content': f'Begin the authorized penetration test against target {self.target}. Start with enumeration.',
         })
 
-        log(f"{C_MAGENTA}Phase: ENUMERATION{C_RESET}")
+        L.log(f"{C_MAGENTA}Phase: ENUMERATION{C_RESET}")
 
         while self.phase != 'complete' and self.total_iterations < MAX_TOTAL_ITERATIONS:
             phase_iterations = 0
@@ -175,7 +221,7 @@ class Agent:
                 self.total_iterations += 1
                 phase_iterations += 1
 
-                log(f"{C_DIM}--- Iteration {self.total_iterations}/{MAX_TOTAL_ITERATIONS} (phase: {phase_iterations}/{MAX_ITERATIONS_PER_PHASE}) ---{C_RESET}")
+                L.log(f"{C_DIM}--- Iteration {self.total_iterations}/{MAX_TOTAL_ITERATIONS} (phase: {phase_iterations}/{MAX_ITERATIONS_PER_PHASE}) ---{C_RESET}")
 
                 # Build messages with fresh system prompt
                 system_prompt = self._build_system_prompt()
@@ -183,14 +229,15 @@ class Agent:
 
                 tools = self._get_tools()
 
-                log(f"{C_CYAN}Calling LLM ({len(messages)} messages, {len(tools)} tools)...{C_RESET}")
+                L.log(f"{C_CYAN}Calling LLM ({len(messages)} messages, {len(tools)} tools)...{C_RESET}")
                 llm_start = time.time()
 
                 try:
                     response = await chat_completion(self.client, messages, tools)
                 except Exception as e:
-                    log(f"{C_RED}LLM ERROR: {e}{C_RESET}")
+                    L.log(f"{C_RED}LLM ERROR: {e}{C_RESET}")
                     await self.manager.broadcast('error', {'message': f"LLM error: {str(e)}"})
+                    L.close()
                     return
 
                 llm_time = time.time() - llm_start
@@ -202,9 +249,9 @@ class Agent:
                     out = getattr(usage, 'completion_tokens', 0) or 0
                     self.total_input_tokens += inp
                     self.total_output_tokens += out
-                    log(f"{C_DIM}LLM response in {llm_time:.1f}s | tokens: {inp} in / {out} out | total: {self.total_input_tokens} in / {self.total_output_tokens} out{C_RESET}")
+                    L.log(f"{C_DIM}LLM response in {llm_time:.1f}s | tokens: {inp} in / {out} out | total: {self.total_input_tokens} in / {self.total_output_tokens} out{C_RESET}")
                 else:
-                    log(f"{C_DIM}LLM response in {llm_time:.1f}s | token usage not available{C_RESET}")
+                    L.log(f"{C_DIM}LLM response in {llm_time:.1f}s | token usage not available{C_RESET}")
 
                 choice = response.choices[0]
                 message = choice.message
@@ -212,7 +259,7 @@ class Agent:
                 # Log + broadcast thinking text
                 if message.content:
                     text = message.content[:200] + ('...' if len(message.content) > 200 else '')
-                    log(f"{C_YELLOW}Thinking: {text}{C_RESET}")
+                    L.log(f"{C_YELLOW}Thinking: {text}{C_RESET}")
                     await self.manager.broadcast('agent_thinking', {'text': message.content})
 
                 # Add assistant message to history
@@ -233,7 +280,7 @@ class Agent:
 
                 # If no tool calls, the model is done thinking for this turn
                 if not message.tool_calls:
-                    log(f"{C_DIM}No tool calls, finish_reason={choice.finish_reason}{C_RESET}")
+                    L.log(f"{C_DIM}No tool calls, finish_reason={choice.finish_reason}{C_RESET}")
                     if choice.finish_reason == 'stop':
                         break
                     continue
@@ -250,7 +297,7 @@ class Agent:
                     # Normalize argument names
                     args = normalize_args(name, raw_args)
                     if args != raw_args:
-                        log(f"{C_YELLOW}Args normalized: {json.dumps(raw_args)} -> {json.dumps(args)}{C_RESET}")
+                        L.log(f"{C_YELLOW}Args normalized: {json.dumps(raw_args)} -> {json.dumps(args)}{C_RESET}")
 
                     call_id = tc.id
 
@@ -258,7 +305,7 @@ class Agent:
                     args_short = json.dumps(args)
                     if len(args_short) > 150:
                         args_short = args_short[:150] + '...'
-                    log(f"{C_GREEN}Tool call: {C_BOLD}{name}{C_RESET}{C_GREEN} | {args_short}{C_RESET}")
+                    L.log(f"{C_GREEN}Tool call: {C_BOLD}{name}{C_RESET}{C_GREEN} | {args_short}{C_RESET}")
 
                     await self.manager.broadcast('tool_call', {'id': call_id, 'name': name, 'args': args})
 
@@ -269,7 +316,7 @@ class Agent:
                     # Log tool result summary
                     result_lines = result.count('\n') + 1
                     result_len = len(result)
-                    log(f"{C_GREEN}Tool done: {name} | {tool_time:.1f}s | {result_len} chars, {result_lines} lines{C_RESET}")
+                    L.log(f"{C_GREEN}Tool done: {name} | {tool_time:.1f}s | {result_len} chars, {result_lines} lines{C_RESET}")
 
                     # Auto-update graph from tool output
                     if name in TOOL_PARSERS and not result.startswith('[ERROR]') and not result.startswith('[TIMEOUT'):
@@ -279,7 +326,7 @@ class Agent:
                             await self._broadcast_graph()
                             node_count = len(parsed['nodes'])
                             edge_count = len(parsed['edges'])
-                            log(f"{C_BLUE}Auto-graph: +{node_count} nodes, +{edge_count} edges from {name}{C_RESET}")
+                            L.log(f"{C_BLUE}Auto-graph: +{node_count} nodes, +{edge_count} edges from {name}{C_RESET}")
 
                     await self.manager.broadcast('tool_result', {'id': call_id, 'result': result, 'error': False})
 
@@ -292,15 +339,25 @@ class Agent:
 
                     # Check for phase transition
                     if name == 'transition_phase':
-                        next_phase = args.get('next_phase', 'complete')
+                        next_phase = args.get('next_phase', '')
+                        if not next_phase or next_phase not in PHASES + ['complete']:
+                            # Invalid transition — auto-advance to next phase
+                            current_idx = PHASES.index(self.phase) if self.phase in PHASES else -1
+                            if current_idx < len(PHASES) - 1:
+                                next_phase = PHASES[current_idx + 1]
+                            else:
+                                next_phase = 'complete'
+                            L.log(f"{C_YELLOW}Invalid transition target, auto-advancing to {next_phase}{C_RESET}")
+
                         if next_phase == 'complete':
                             self.phase = 'complete'
                         elif next_phase in PHASES:
                             self.phase = next_phase
-                        log(f"\n{C_MAGENTA}{'='*40}{C_RESET}")
-                        log(f"{C_MAGENTA}Phase: {self.phase.upper()}{C_RESET}")
-                        log(f"{C_MAGENTA}Reason: {args.get('reason', 'N/A')}{C_RESET}")
-                        log(f"{C_MAGENTA}{'='*40}{C_RESET}\n")
+
+                        L.log(f"\n{C_MAGENTA}{'='*40}{C_RESET}")
+                        L.log(f"{C_MAGENTA}Phase: {self.phase.upper()}{C_RESET}")
+                        L.log(f"{C_MAGENTA}Reason: {args.get('reason', 'N/A')}{C_RESET}")
+                        L.log(f"{C_MAGENTA}{'='*40}{C_RESET}\n")
                         await self.manager.broadcast('phase_change', {'phase': self.phase})
                         should_break = True
 
@@ -308,34 +365,40 @@ class Agent:
                     break
 
         # Final summary
-        print(f"\n{C_BOLD}{C_BLUE}{'='*60}{C_RESET}")
-        print(f"{C_BOLD}{C_BLUE}  COMPLETE{C_RESET}")
-        print(f"{C_BOLD}{C_BLUE}  Iterations: {self.total_iterations}{C_RESET}")
-        print(f"{C_BOLD}{C_BLUE}  Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out{C_RESET}")
-        print(f"{C_BOLD}{C_BLUE}  Graph: {len(self.graph.nodes)} nodes, {len(self.graph.edges)} edges{C_RESET}")
-        print(f"{C_BOLD}{C_BLUE}{'='*60}{C_RESET}\n")
+        L.header(f"\n{C_BOLD}{C_BLUE}{'='*60}{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  COMPLETE{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Iterations: {self.total_iterations}{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Graph: {len(self.graph.nodes)} nodes, {len(self.graph.edges)} edges{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Log saved: {L.log_path}{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}{'='*60}{C_RESET}\n")
 
         await self.manager.broadcast('report_update', {'markdown': self.report.get_markdown()})
         await self.manager.broadcast('complete', {})
+        L.close()
 
     async def _execute_tool(self, name: str, args: dict) -> str:
         """Execute a tool by name and return the result string."""
+        L = self.logger
+
         # Meta-tools
         if name == 'update_graph':
-            # Model shouldn't call this anymore, but handle gracefully
             self.graph.update_from_args(args)
             await self._broadcast_graph()
             return "Graph updated."
 
         if name == 'transition_phase':
             reason = args.get('reason', '')
-            return f"Transitioning to {args.get('next_phase', 'complete')}. Reason: {reason}"
+            return f"Transitioning to {args.get('next_phase', 'next')}. Reason: {reason}"
 
         if name == 'append_report':
             md = args.get('markdown', '')
+            if not md:
+                # Try to build from whatever the model sent
+                md = json.dumps(args, indent=2) if args else ''
             self.report.append(md)
             await self.manager.broadcast('report_update', {'markdown': self.report.get_markdown()})
-            log(f"{C_CYAN}Report appended ({len(md)} chars){C_RESET}")
+            L.log(f"{C_CYAN}Report appended ({len(md)} chars){C_RESET}")
             return "Report section appended."
 
         # Phase tools
@@ -349,10 +412,13 @@ class Agent:
                 if param_name in args:
                     valid_args[param_name] = args[param_name]
                 elif param.default is inspect.Parameter.empty:
-                    # Required arg missing — try to inject target from context
+                    # Required arg missing — try to inject from context
                     if param_name == 'target':
                         valid_args['target'] = self.target
-                        log(f"{C_YELLOW}Injected missing arg: target={self.target}{C_RESET}")
+                        L.log(f"{C_YELLOW}Injected missing arg: target={self.target}{C_RESET}")
+                    elif param_name == 'url':
+                        valid_args['url'] = f'http://{self.target}'
+                        L.log(f"{C_YELLOW}Injected missing arg: url=http://{self.target}{C_RESET}")
             try:
                 result = await func(**valid_args)
                 return result
