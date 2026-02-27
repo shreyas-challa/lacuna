@@ -1,24 +1,21 @@
 import os
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from dedalus_labs import AsyncDedalus
 
 load_dotenv()
 
 MODEL = "anthropic/claude-opus-4-5-20251101"
 
 
-def get_client() -> AsyncOpenAI:
-    """Create a Dedalus Labs API client (OpenAI-compatible)."""
+def get_client() -> AsyncDedalus:
+    """Create a Dedalus Labs API client."""
     api_key = os.getenv("DEDALUS_API_KEY")
     if not api_key:
         raise ValueError("DEDALUS_API_KEY not set. Copy .env.example to .env and fill it in.")
-    return AsyncOpenAI(
-        api_key=api_key,
-        base_url="https://api.dedalus-labs.com/v1",
-    )
+    return AsyncDedalus(api_key=api_key)
 
 
-async def chat_completion(client: AsyncOpenAI, messages: list, tools: list | None = None) -> dict:
+async def chat_completion(client: AsyncDedalus, messages: list, tools: list | None = None):
     """Call the LLM and return the raw response."""
     kwargs = {
         'model': MODEL,

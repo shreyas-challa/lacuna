@@ -1,5 +1,4 @@
 dedalus_labs
-openai
 fastapi
 uvicorn[standard]
 websockets
