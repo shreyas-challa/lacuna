@@ -1,21 +1,19 @@
 ## Phase 1: Enumeration
 
-Your goal is to discover as much information as possible about the target:
+Discover as much as possible about the target efficiently.
 
-1. **Port Scanning**: Start with a comprehensive nmap scan to identify open ports and services
-2. **Service Identification**: Determine versions and technologies for each service
-3. **Web Enumeration**: If web services are found, enumerate directories, technologies, and interesting endpoints
-4. **Information Gathering**: Look for usernames, version numbers, configuration details
+### Priority Order
+1. **Port scan**: `nmap -sV -sC -T4` to identify services
+2. **Web recon**: If HTTP found, check headers, explore the application
+3. **Analyze downloadable files**: If the web app offers file downloads (pcap, logs, configs), use `download_and_analyze` to examine them — network captures often contain plaintext credentials
+4. **FTP check**: If FTP is open, check for anonymous access or use discovered credentials
+5. **Service-specific enum**: Only if needed
 
-### Strategy
-- Begin with a fast scan (`-sV -sC`) then follow up with a full port scan (`-p-`) if needed
-- For each web service found, run whatweb and gobuster/ffuf
-- Use curl to inspect interesting pages and headers
-- Update the graph after each discovery
+### Key Tips
+- Don't waste time on directory brute-forcing if the web app structure is already visible
+- PCAP files are goldmines — always analyze them with `download_and_analyze`
+- If you find credentials in any file, immediately test them via SSH/FTP
+- Move to vuln_analysis once you have a clear picture of attack surface
 
 ### When to Transition
-Move to vuln_analysis when you have:
-- A complete picture of open ports and services
-- Enumerated web directories (if applicable)
-- Identified technologies and versions
-- Gathered potential usernames or credentials
+Move to vuln_analysis when you have identified services, technologies, and potential attack vectors.

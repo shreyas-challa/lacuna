@@ -1,7 +1,6 @@
 import json
+import re
 import time
-import sys
-import io
 from pathlib import Path
 from datetime import datetime
 
@@ -30,48 +29,21 @@ C_RED = '\033[91m'
 C_CYAN = '\033[96m'
 C_MAGENTA = '\033[95m'
 
-# Argument name aliases — maps common model guesses to our expected names
+# Argument name aliases
 ARG_ALIASES = {
-    # target aliases
-    'host': 'target',
-    'ip': 'target',
-    'hostname': 'target',
-    'address': 'target',
-    'rhost': 'target',
-    # flags aliases
-    'options': 'flags',
-    'args': 'flags',
-    'arguments': 'flags',
-    'params': 'flags',
-    'nmap_flags': 'flags',
-    'scan_flags': 'flags',
-    # wordlist aliases
-    'dictionary': 'wordlist',
-    'wordlist_path': 'wordlist',
-    'list': 'wordlist',
-    # query aliases
-    'search': 'query',
-    'term': 'query',
-    'search_query': 'query',
-    # command aliases
-    'cmd': 'command',
-    'shell_command': 'command',
-    'exec': 'command',
-    # url aliases
-    'target_url': 'url',
-    'site': 'url',
-    # report aliases
-    'content': 'markdown',
-    'text': 'markdown',
-    'body': 'markdown',
-    # filename aliases
-    'file': 'filename',
-    'name': 'filename',
-    'output': 'filename',
+    'host': 'target', 'ip': 'target', 'hostname': 'target',
+    'address': 'target', 'rhost': 'target',
+    'options': 'flags', 'args': 'flags', 'arguments': 'flags',
+    'params': 'flags', 'nmap_flags': 'flags', 'scan_flags': 'flags',
+    'dictionary': 'wordlist', 'wordlist_path': 'wordlist', 'list': 'wordlist',
+    'search': 'query', 'term': 'query', 'search_query': 'query',
+    'cmd': 'command', 'shell_command': 'command', 'exec': 'command',
+    'target_url': 'url', 'site': 'url',
+    'content': 'markdown', 'text': 'markdown', 'body': 'markdown',
+    'file': 'filename', 'name': 'filename', 'output': 'filename',
     'file_name': 'filename',
 }
 
-# Meta-tool schemas (transition_phase and append_report only — graph is auto-updated)
 META_TOOLS = [
     {
         'type': 'function',
@@ -96,7 +68,7 @@ META_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'append_report',
-            'description': 'Append a markdown section to the penetration test report. Call this after completing significant findings or actions.',
+            'description': 'Append a markdown section to the penetration test report.',
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -117,8 +89,6 @@ def load_prompt(filename: str) -> str:
 
 
 class SessionLogger:
-    """Tees all output to both terminal and a log file."""
-
     def __init__(self, target: str):
         LOGS_DIR.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -127,20 +97,14 @@ class SessionLogger:
         self.log_file = open(self.log_path, 'w')
 
     def log(self, msg: str):
-        """Print to terminal with colors and write plain text to log file."""
         timestamp = time.strftime('%H:%M:%S')
-        colored = f"{C_DIM}[{timestamp}]{C_RESET} {msg}"
-        print(colored)
-        # Strip ANSI for log file
-        import re
+        print(f"{C_DIM}[{timestamp}]{C_RESET} {msg}")
         plain = re.sub(r'\033\[[0-9;]*m', '', f'[{timestamp}] {msg}')
         self.log_file.write(plain + '\n')
         self.log_file.flush()
 
     def header(self, msg: str):
-        """Print a header line."""
         print(msg)
-        import re
         plain = re.sub(r'\033\[[0-9;]*m', '', msg)
         self.log_file.write(plain + '\n')
         self.log_file.flush()
@@ -150,13 +114,10 @@ class SessionLogger:
 
 
 def normalize_args(name: str, args: dict) -> dict:
-    """Normalize argument names from model guesses to expected parameter names."""
     normalized = {}
     for key, value in args.items():
         canonical = ARG_ALIASES.get(key, key)
         normalized[canonical] = value
-
-    # For append_report: combine title + markdown if both present
     if name == 'append_report' and 'title' in args:
         title = args.get('title', '')
         md = normalized.get('markdown', '')
@@ -164,8 +125,50 @@ def normalize_args(name: str, args: dict) -> dict:
             normalized['markdown'] = f"## {title}\n\n{md}"
         elif title and not md:
             normalized['markdown'] = f"## {title}"
-
     return normalized
+
+
+def parse_command_output_for_graph(output: str, target: str) -> dict:
+    """Extract user/root access from execute_command output for the graph."""
+    nodes = []
+    edges = []
+
+    # Detect SSH user access (uid=1000(nathan) or similar)
+    for m in re.finditer(r'uid=\d+\((\w+)\)', output):
+        user = m.group(1)
+        if user == 'root':
+            nodes.append({'id': 'root-access', 'label': 'ROOT ACCESS', 'type': 'root'})
+            edges.append({'source': target, 'target': 'root-access', 'label': 'privesc'})
+        elif user != 'nobody':
+            node_id = f'user-{user}'
+            nodes.append({'id': node_id, 'label': f'User: {user}', 'type': 'user'})
+            edges.append({'source': target, 'target': node_id, 'label': 'ssh'})
+
+    # Detect user flag
+    if re.search(r'user\.txt', output) and re.search(r'[0-9a-f]{32}', output):
+        flag = re.search(r'[0-9a-f]{32}', output).group()
+        nodes.append({'id': 'user-flag', 'label': f'user.txt', 'type': 'vulnerability'})
+
+    # Detect root flag
+    if re.search(r'root\.txt', output) and re.search(r'[0-9a-f]{32}', output):
+        nodes.append({'id': 'root-flag', 'label': f'root.txt', 'type': 'root'})
+        edges.append({'source': 'root-access', 'target': 'root-flag', 'label': 'flag'})
+
+    # Detect credentials in output (FTP USER/PASS from pcap strings)
+    for m in re.finditer(r'USER\s+(\S+)', output):
+        user = m.group(1)
+        if user and user not in ('anonymous', 'ftp'):
+            nodes.append({'id': f'user-{user}', 'label': f'User: {user}', 'type': 'user'})
+            edges.append({'source': target, 'target': f'user-{user}', 'label': 'cred found'})
+    for m in re.finditer(r'PASS\s+(\S+)', output):
+        nodes.append({'id': 'cred-found', 'label': 'Credentials Found', 'type': 'vulnerability'})
+
+    # Detect cap_setuid or capability escalation
+    if 'cap_setuid' in output:
+        nodes.append({'id': 'vuln-cap-setuid', 'label': 'cap_setuid (Python)', 'type': 'vulnerability'})
+        edges.append({'source': target, 'target': 'vuln-cap-setuid', 'label': 'capability'})
+
+    return {'nodes': nodes, 'edges': edges}
 
 
 class Agent:
@@ -181,6 +184,7 @@ class Agent:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.logger = SessionLogger(target)
+        self._done = False  # signals agent should stop entirely
 
     def _build_system_prompt(self) -> str:
         system = load_prompt("system.md")
@@ -193,7 +197,6 @@ class Agent:
         return META_TOOLS + phase_tools
 
     async def run(self):
-        """Main agent loop."""
         L = self.logger
 
         L.header(f"\n{C_BOLD}{C_BLUE}{'='*60}{C_RESET}")
@@ -202,7 +205,6 @@ class Agent:
         L.header(f"{C_BOLD}{C_BLUE}  Log: {L.log_path}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}{'='*60}{C_RESET}\n")
 
-        # Add initial target node and seed the conversation
         self.graph.add_node(self.target, self.target, 'machine')
         await self._broadcast_graph()
         await self.manager.broadcast('phase_change', {'phase': self.phase})
@@ -214,8 +216,9 @@ class Agent:
 
         L.log(f"{C_MAGENTA}Phase: ENUMERATION{C_RESET}")
 
-        while self.phase != 'complete' and self.total_iterations < MAX_TOTAL_ITERATIONS:
+        while self.phase != 'complete' and self.total_iterations < MAX_TOTAL_ITERATIONS and not self._done:
             phase_iterations = 0
+            consecutive_stops = 0
 
             while phase_iterations < MAX_ITERATIONS_PER_PHASE and self.total_iterations < MAX_TOTAL_ITERATIONS:
                 self.total_iterations += 1
@@ -223,10 +226,8 @@ class Agent:
 
                 L.log(f"{C_DIM}--- Iteration {self.total_iterations}/{MAX_TOTAL_ITERATIONS} (phase: {phase_iterations}/{MAX_ITERATIONS_PER_PHASE}) ---{C_RESET}")
 
-                # Build messages with fresh system prompt
                 system_prompt = self._build_system_prompt()
                 messages = [{'role': 'system', 'content': system_prompt}] + self.messages
-
                 tools = self._get_tools()
 
                 L.log(f"{C_CYAN}Calling LLM ({len(messages)} messages, {len(tools)} tools)...{C_RESET}")
@@ -241,8 +242,6 @@ class Agent:
                     return
 
                 llm_time = time.time() - llm_start
-
-                # Token tracking
                 usage = getattr(response, 'usage', None)
                 if usage:
                     inp = getattr(usage, 'prompt_tokens', 0) or 0
@@ -251,18 +250,16 @@ class Agent:
                     self.total_output_tokens += out
                     L.log(f"{C_DIM}LLM response in {llm_time:.1f}s | tokens: {inp} in / {out} out | total: {self.total_input_tokens} in / {self.total_output_tokens} out{C_RESET}")
                 else:
-                    L.log(f"{C_DIM}LLM response in {llm_time:.1f}s | token usage not available{C_RESET}")
+                    L.log(f"{C_DIM}LLM response in {llm_time:.1f}s{C_RESET}")
 
                 choice = response.choices[0]
                 message = choice.message
 
-                # Log + broadcast thinking text
                 if message.content:
                     text = message.content[:200] + ('...' if len(message.content) > 200 else '')
                     L.log(f"{C_YELLOW}Thinking: {text}{C_RESET}")
                     await self.manager.broadcast('agent_thinking', {'text': message.content})
 
-                # Add assistant message to history
                 assistant_msg = {'role': 'assistant', 'content': message.content or ''}
                 if message.tool_calls:
                     assistant_msg['tool_calls'] = [
@@ -278,12 +275,28 @@ class Agent:
                     ]
                 self.messages.append(assistant_msg)
 
-                # If no tool calls, the model is done thinking for this turn
+                # No tool calls = model is done
                 if not message.tool_calls:
-                    L.log(f"{C_DIM}No tool calls, finish_reason={choice.finish_reason}{C_RESET}")
-                    if choice.finish_reason == 'stop':
+                    consecutive_stops += 1
+                    L.log(f"{C_DIM}No tool calls (stop #{consecutive_stops}), finish_reason={choice.finish_reason}{C_RESET}")
+
+                    # CRITICAL: if model stops without tool calls, it's done with this phase
+                    # Don't keep looping — either advance phase or complete
+                    if consecutive_stops >= 1:
+                        current_idx = PHASES.index(self.phase) if self.phase in PHASES else len(PHASES) - 1
+                        if current_idx < len(PHASES) - 1:
+                            self.phase = PHASES[current_idx + 1]
+                            L.log(f"{C_MAGENTA}Auto-advancing to {self.phase.upper()} (model stopped){C_RESET}")
+                            await self.manager.broadcast('phase_change', {'phase': self.phase})
+                        else:
+                            self.phase = 'complete'
+                            self._done = True
+                            L.log(f"{C_MAGENTA}All phases complete — finishing{C_RESET}")
                         break
                     continue
+
+                # Reset stop counter on tool calls
+                consecutive_stops = 0
 
                 # Process tool calls
                 should_break = False
@@ -294,14 +307,11 @@ class Agent:
                     except json.JSONDecodeError:
                         raw_args = {}
 
-                    # Normalize argument names
                     args = normalize_args(name, raw_args)
                     if args != raw_args:
-                        L.log(f"{C_YELLOW}Args normalized: {json.dumps(raw_args)} -> {json.dumps(args)}{C_RESET}")
+                        L.log(f"{C_YELLOW}Args normalized: {json.dumps(raw_args)[:100]} -> {json.dumps(args)[:100]}{C_RESET}")
 
                     call_id = tc.id
-
-                    # Log the tool call
                     args_short = json.dumps(args)
                     if len(args_short) > 150:
                         args_short = args_short[:150] + '...'
@@ -313,44 +323,41 @@ class Agent:
                     result = await self._execute_tool(name, args)
                     tool_time = time.time() - tool_start
 
-                    # Log tool result summary
                     result_lines = result.count('\n') + 1
-                    result_len = len(result)
-                    L.log(f"{C_GREEN}Tool done: {name} | {tool_time:.1f}s | {result_len} chars, {result_lines} lines{C_RESET}")
+                    L.log(f"{C_GREEN}Tool done: {name} | {tool_time:.1f}s | {len(result)} chars, {result_lines} lines{C_RESET}")
 
                     # Auto-update graph from tool output
+                    parsed = None
                     if name in TOOL_PARSERS and not result.startswith('[ERROR]') and not result.startswith('[TIMEOUT'):
                         parsed = TOOL_PARSERS[name](result, self.target)
-                        if parsed['nodes'] or parsed['edges']:
-                            self.graph.update_from_args(parsed)
-                            await self._broadcast_graph()
-                            node_count = len(parsed['nodes'])
-                            edge_count = len(parsed['edges'])
-                            L.log(f"{C_BLUE}Auto-graph: +{node_count} nodes, +{edge_count} edges from {name}{C_RESET}")
+                    elif name in ('execute_command', 'download_and_analyze') and not result.startswith('[ERROR]'):
+                        parsed = parse_command_output_for_graph(result, self.target)
+
+                    if parsed and (parsed['nodes'] or parsed['edges']):
+                        self.graph.update_from_args(parsed)
+                        await self._broadcast_graph()
+                        L.log(f"{C_BLUE}Auto-graph: +{len(parsed['nodes'])} nodes, +{len(parsed['edges'])} edges{C_RESET}")
 
                     await self.manager.broadcast('tool_result', {'id': call_id, 'result': result, 'error': False})
 
-                    # Add tool response to messages
                     self.messages.append({
                         'role': 'tool',
                         'tool_call_id': call_id,
                         'content': result,
                     })
 
-                    # Check for phase transition
                     if name == 'transition_phase':
                         next_phase = args.get('next_phase', '')
                         if not next_phase or next_phase not in PHASES + ['complete']:
-                            # Invalid transition — auto-advance to next phase
                             current_idx = PHASES.index(self.phase) if self.phase in PHASES else -1
                             if current_idx < len(PHASES) - 1:
                                 next_phase = PHASES[current_idx + 1]
                             else:
                                 next_phase = 'complete'
-                            L.log(f"{C_YELLOW}Invalid transition target, auto-advancing to {next_phase}{C_RESET}")
 
                         if next_phase == 'complete':
                             self.phase = 'complete'
+                            self._done = True
                         elif next_phase in PHASES:
                             self.phase = next_phase
 
@@ -378,50 +385,42 @@ class Agent:
         L.close()
 
     async def _execute_tool(self, name: str, args: dict) -> str:
-        """Execute a tool by name and return the result string."""
         L = self.logger
 
-        # Meta-tools
         if name == 'update_graph':
             self.graph.update_from_args(args)
             await self._broadcast_graph()
             return "Graph updated."
 
         if name == 'transition_phase':
-            reason = args.get('reason', '')
-            return f"Transitioning to {args.get('next_phase', 'next')}. Reason: {reason}"
+            return f"Transitioning to {args.get('next_phase', 'next')}. Reason: {args.get('reason', '')}"
 
         if name == 'append_report':
             md = args.get('markdown', '')
             if not md:
-                # Try to build from whatever the model sent
                 md = json.dumps(args, indent=2) if args else ''
             self.report.append(md)
             await self.manager.broadcast('report_update', {'markdown': self.report.get_markdown()})
             L.log(f"{C_CYAN}Report appended ({len(md)} chars){C_RESET}")
             return "Report section appended."
 
-        # Phase tools
         if name in TOOL_REGISTRY:
-            func = TOOL_REGISTRY[name]['function']
-            # Filter args to only what the function accepts
             import inspect
+            func = TOOL_REGISTRY[name]['function']
             sig = inspect.signature(func)
             valid_args = {}
             for param_name, param in sig.parameters.items():
                 if param_name in args:
                     valid_args[param_name] = args[param_name]
                 elif param.default is inspect.Parameter.empty:
-                    # Required arg missing — try to inject from context
                     if param_name == 'target':
                         valid_args['target'] = self.target
-                        L.log(f"{C_YELLOW}Injected missing arg: target={self.target}{C_RESET}")
+                        L.log(f"{C_YELLOW}Injected missing: target={self.target}{C_RESET}")
                     elif param_name == 'url':
                         valid_args['url'] = f'http://{self.target}'
-                        L.log(f"{C_YELLOW}Injected missing arg: url=http://{self.target}{C_RESET}")
+                        L.log(f"{C_YELLOW}Injected missing: url=http://{self.target}{C_RESET}")
             try:
-                result = await func(**valid_args)
-                return result
+                return await func(**valid_args)
             except Exception as e:
                 return f"[ERROR] Tool {name} failed: {str(e)}"
 

