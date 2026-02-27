@@ -26,47 +26,40 @@ C_RED = '\033[91m'
 C_CYAN = '\033[96m'
 C_MAGENTA = '\033[95m'
 
-# Meta-tool schemas (always available)
+# Argument name aliases — maps common model guesses to our expected names
+ARG_ALIASES = {
+    # target aliases
+    'host': 'target',
+    'ip': 'target',
+    'hostname': 'target',
+    'address': 'target',
+    'rhost': 'target',
+    # flags aliases
+    'options': 'flags',
+    'args': 'flags',
+    'arguments': 'flags',
+    'params': 'flags',
+    'nmap_flags': 'flags',
+    'scan_flags': 'flags',
+    # wordlist aliases
+    'dictionary': 'wordlist',
+    'wordlist_path': 'wordlist',
+    'list': 'wordlist',
+    # query aliases
+    'search': 'query',
+    'term': 'query',
+    'search_query': 'query',
+    # command aliases
+    'cmd': 'command',
+    'shell_command': 'command',
+    'exec': 'command',
+    # url aliases
+    'target_url': 'url',
+    'site': 'url',
+}
+
+# Meta-tool schemas (transition_phase and append_report only — graph is auto-updated)
 META_TOOLS = [
-    {
-        'type': 'function',
-        'function': {
-            'name': 'update_graph',
-            'description': 'Update the attack graph with new nodes and edges. The graph is auto-updated from tool outputs, but use this for manual additions like discovered usernames, credentials, or attack paths not captured automatically.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'nodes': {
-                        'type': 'array',
-                        'items': {
-                            'type': 'object',
-                            'properties': {
-                                'id': {'type': 'string', 'description': 'Unique node ID'},
-                                'label': {'type': 'string', 'description': 'Display label'},
-                                'type': {'type': 'string', 'enum': ['machine', 'service', 'user', 'vulnerability', 'root'], 'description': 'Node type'},
-                            },
-                            'required': ['id', 'label', 'type'],
-                        },
-                        'description': 'Nodes to add/update',
-                    },
-                    'edges': {
-                        'type': 'array',
-                        'items': {
-                            'type': 'object',
-                            'properties': {
-                                'source': {'type': 'string'},
-                                'target': {'type': 'string'},
-                                'label': {'type': 'string', 'description': 'Edge label'},
-                            },
-                            'required': ['source', 'target'],
-                        },
-                        'description': 'Edges to add',
-                    },
-                },
-                'required': [],
-            },
-        },
-    },
     {
         'type': 'function',
         'function': {
@@ -112,6 +105,25 @@ def load_prompt(filename: str) -> str:
 
 def log(msg: str):
     print(f"{C_DIM}[{time.strftime('%H:%M:%S')}]{C_RESET} {msg}")
+
+
+def normalize_args(name: str, args: dict) -> dict:
+    """Normalize argument names from model guesses to expected parameter names."""
+    normalized = {}
+    for key, value in args.items():
+        canonical = ARG_ALIASES.get(key, key)
+        normalized[canonical] = value
+
+    # If tool expects 'target' and we have it nowhere, check if it's in the tool registry
+    if name in TOOL_REGISTRY:
+        schema_props = TOOL_REGISTRY[name]['parameters'].get('properties', {})
+        for expected_key in schema_props:
+            if expected_key not in normalized:
+                # Check if any value in normalized could be the target
+                # e.g. model sent {"host": "10.10.10.1"} -> already handled by aliases
+                pass
+
+    return normalized
 
 
 class Agent:
@@ -231,9 +243,14 @@ class Agent:
                 for tc in message.tool_calls:
                     name = tc.function.name
                     try:
-                        args = json.loads(tc.function.arguments)
+                        raw_args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
-                        args = {}
+                        raw_args = {}
+
+                    # Normalize argument names
+                    args = normalize_args(name, raw_args)
+                    if args != raw_args:
+                        log(f"{C_YELLOW}Args normalized: {json.dumps(raw_args)} -> {json.dumps(args)}{C_RESET}")
 
                     call_id = tc.id
 
@@ -305,12 +322,10 @@ class Agent:
         """Execute a tool by name and return the result string."""
         # Meta-tools
         if name == 'update_graph':
+            # Model shouldn't call this anymore, but handle gracefully
             self.graph.update_from_args(args)
             await self._broadcast_graph()
-            node_count = len(args.get('nodes', []))
-            edge_count = len(args.get('edges', []))
-            log(f"{C_BLUE}Manual graph update: +{node_count} nodes, +{edge_count} edges{C_RESET}")
-            return "Graph updated successfully."
+            return "Graph updated."
 
         if name == 'transition_phase':
             reason = args.get('reason', '')
@@ -326,8 +341,20 @@ class Agent:
         # Phase tools
         if name in TOOL_REGISTRY:
             func = TOOL_REGISTRY[name]['function']
+            # Filter args to only what the function accepts
+            import inspect
+            sig = inspect.signature(func)
+            valid_args = {}
+            for param_name, param in sig.parameters.items():
+                if param_name in args:
+                    valid_args[param_name] = args[param_name]
+                elif param.default is inspect.Parameter.empty:
+                    # Required arg missing — try to inject target from context
+                    if param_name == 'target':
+                        valid_args['target'] = self.target
+                        log(f"{C_YELLOW}Injected missing arg: target={self.target}{C_RESET}")
             try:
-                result = await func(**args)
+                result = await func(**valid_args)
                 return result
             except Exception as e:
                 return f"[ERROR] Tool {name} failed: {str(e)}"

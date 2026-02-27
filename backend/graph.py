@@ -45,8 +45,16 @@ class GraphManager:
         return '\n'.join(lines)
 
     def update_from_args(self, args: dict):
-        """Process an update_graph tool call."""
+        """Process an update_graph call. Tolerant of various key names."""
         for node in args.get('nodes', []):
-            self.add_node(node['id'], node['label'], node.get('type', 'service'))
+            node_id = node.get('id') or node.get('name', '')
+            label = node.get('label') or node.get('name') or node_id
+            ntype = node.get('type', 'service')
+            if node_id:
+                self.add_node(node_id, label, ntype)
         for edge in args.get('edges', []):
-            self.add_edge(edge['source'], edge['target'], edge.get('label', ''))
+            src = edge.get('source') or edge.get('from') or edge.get('src', '')
+            tgt = edge.get('target') or edge.get('to') or edge.get('dst', '')
+            label = edge.get('label') or edge.get('relation', '')
+            if src and tgt:
+                self.add_edge(src, tgt, label)
