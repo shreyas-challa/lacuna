@@ -1,0 +1,305 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --bg: #0a0e17;
+  --bg-panel: #111827;
+  --bg-card: #1a2235;
+  --border: #2a3550;
+  --text: #e0e6f0;
+  --text-dim: #7a8ba8;
+  --accent: #3b82f6;
+  --green: #22c55e;
+  --yellow: #eab308;
+  --orange: #f97316;
+  --red: #ef4444;
+}
+
+body {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Header */
+header {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 12px 20px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  z-index: 10;
+}
+
+.logo {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  color: var(--accent);
+}
+
+.controls {
+  display: flex;
+  gap: 8px;
+}
+
+.controls input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+  width: 220px;
+}
+
+.controls input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.controls button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 6px 20px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  letter-spacing: 1px;
+}
+
+.controls button:hover {
+  opacity: 0.9;
+}
+
+.controls button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.phase-indicator {
+  margin-left: auto;
+  background: var(--bg);
+  padding: 6px 16px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+
+/* Main layout */
+main {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+#graph-container {
+  flex: 0 0 60%;
+  position: relative;
+  overflow: hidden;
+}
+
+#graph-svg {
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+}
+
+/* Panel */
+#panel {
+  flex: 0 0 40%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border);
+}
+
+.panel-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  flex: 1;
+  padding: 10px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+
+.tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.panel-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: none;
+}
+
+.panel-content.active {
+  display: block;
+}
+
+/* Tool log */
+.tool-entry {
+  margin-bottom: 10px;
+  background: var(--bg-card);
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.tool-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tool-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.tool-status {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+
+.tool-status.running {
+  background: rgba(59, 130, 246, 0.2);
+  color: var(--accent);
+}
+
+.tool-status.done {
+  background: rgba(34, 197, 94, 0.2);
+  color: var(--green);
+}
+
+.tool-status.error {
+  background: rgba(239, 68, 68, 0.2);
+  color: var(--red);
+}
+
+.tool-body {
+  display: none;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.tool-body.open {
+  display: block;
+}
+
+/* Agent thinking */
+.thinking-entry {
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  background: rgba(59, 130, 246, 0.05);
+  border-left: 2px solid var(--accent);
+  border-radius: 0 4px 4px 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+/* Report */
+#report-content {
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+#report-content h1,
+#report-content h2,
+#report-content h3 {
+  color: var(--text);
+  margin: 16px 0 8px;
+}
+
+#report-content code {
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+#report-content pre {
+  background: var(--bg);
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+#report-content pre code {
+  padding: 0;
+  background: none;
+}
+
+/* Graph node labels */
+.node-label {
+  font-size: 10px;
+  fill: var(--text);
+  text-anchor: middle;
+  pointer-events: none;
+  font-family: inherit;
+}
+
+/* Graph links */
+.graph-link {
+  stroke: var(--border);
+  stroke-opacity: 0.6;
+}
+
+.graph-link-label {
+  font-size: 9px;
+  fill: var(--text-dim);
+  text-anchor: middle;
+  font-family: inherit;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}

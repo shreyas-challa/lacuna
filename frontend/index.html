@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lacuna — Security Research Agent</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="logo">LACUNA</div>
+    <div class="controls">
+      <input type="text" id="target-input" placeholder="Target IP (e.g. 10.10.10.1)">
+      <button id="start-btn">START</button>
+    </div>
+    <div class="phase-indicator">
+      <span id="phase-label">IDLE</span>
+    </div>
+  </header>
+
+  <main>
+    <div id="graph-container">
+      <svg id="graph-svg"></svg>
+    </div>
+
+    <div id="panel">
+      <div class="panel-tabs">
+        <button class="tab active" data-tab="tools">Tools</button>
+        <button class="tab" data-tab="report">Report</button>
+      </div>
+      <div id="tools-panel" class="panel-content active">
+        <div id="tool-log"></div>
+      </div>
+      <div id="report-panel" class="panel-content">
+        <div id="report-content"></div>
+      </div>
+    </div>
+  </main>
+
+  <script src="/static/graph.js"></script>
+  <script src="/static/toolpanel.js"></script>
+  <script src="/static/report.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
