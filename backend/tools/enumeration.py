@@ -8,15 +8,14 @@ from backend.tools.base import tool, run_command
         'type': 'object',
         'properties': {
             'target': {'type': 'string', 'description': 'Target IP or hostname'},
-            'flags': {'type': 'string', 'description': 'Additional nmap flags (e.g. "-sV -sC -p-")', 'default': '-sV -sC'},
+            'flags': {'type': 'string', 'description': 'Additional nmap flags (e.g. "-sV -sC -T4 -p-")', 'default': '-sV -sC'},
         },
         'required': ['target'],
     },
     phases=['enumeration'],
 )
 async def nmap_scan(target: str, flags: str = '-sV -sC') -> str:
-    cmd = ['nmap'] + flags.split() + [target]
-    return await run_command(cmd, timeout=300)
+    return await run_command(f'nmap {flags} {target}', timeout=300)
 
 
 @tool(
@@ -34,10 +33,7 @@ async def nmap_scan(target: str, flags: str = '-sV -sC') -> str:
     phases=['enumeration'],
 )
 async def gobuster_dir(url: str, wordlist: str = '/usr/share/wordlists/dirb/common.txt', flags: str = '') -> str:
-    cmd = ['gobuster', 'dir', '-u', url, '-w', wordlist]
-    if flags:
-        cmd += flags.split()
-    return await run_command(cmd, timeout=300)
+    return await run_command(f'gobuster dir -u {url} -w {wordlist} {flags}', timeout=300)
 
 
 @tool(
@@ -55,10 +51,7 @@ async def gobuster_dir(url: str, wordlist: str = '/usr/share/wordlists/dirb/comm
     phases=['enumeration'],
 )
 async def ffuf_fuzz(url: str, wordlist: str = '/usr/share/wordlists/dirb/common.txt', flags: str = '') -> str:
-    cmd = ['ffuf', '-u', url, '-w', wordlist, '-c']
-    if flags:
-        cmd += flags.split()
-    return await run_command(cmd, timeout=300)
+    return await run_command(f'ffuf -u {url} -w {wordlist} -c {flags}', timeout=300)
 
 
 @tool(
@@ -74,7 +67,7 @@ async def ffuf_fuzz(url: str, wordlist: str = '/usr/share/wordlists/dirb/common.
     phases=['enumeration'],
 )
 async def whatweb_scan(target: str) -> str:
-    return await run_command(['whatweb', '-a', '3', target])
+    return await run_command(f'whatweb -a 3 {target}')
 
 
 @tool(
@@ -91,5 +84,4 @@ async def whatweb_scan(target: str) -> str:
     phases=['enumeration'],
 )
 async def curl_request(url: str, flags: str = '-s') -> str:
-    cmd = ['curl'] + flags.split() + [url]
-    return await run_command(cmd, timeout=30)
+    return await run_command(f'curl {flags} {url}', timeout=30)

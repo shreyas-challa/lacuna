@@ -3,7 +3,7 @@ from backend.tools.base import tool, run_command
 
 @tool(
     name='run_linpeas',
-    description='Run LinPEAS privilege escalation enumeration script on the target (via execute_command to the shell).',
+    description='Run LinPEAS privilege escalation enumeration script on the target.',
     parameters={
         'type': 'object',
         'properties': {
@@ -14,7 +14,7 @@ from backend.tools.base import tool, run_command
     phases=['privesc'],
 )
 async def run_linpeas(command: str) -> str:
-    return await run_command(['bash', '-c', command], timeout=300)
+    return await run_command(command, timeout=300)
 
 
 @tool(
@@ -30,7 +30,7 @@ async def run_linpeas(command: str) -> str:
     phases=['privesc'],
 )
 async def check_sudo(command: str = 'sudo -l') -> str:
-    return await run_command(['bash', '-c', command])
+    return await run_command(command)
 
 
 @tool(
@@ -46,7 +46,7 @@ async def check_sudo(command: str = 'sudo -l') -> str:
     phases=['privesc'],
 )
 async def check_suid(command: str = 'find / -perm -4000 -type f 2>/dev/null') -> str:
-    return await run_command(['bash', '-c', command])
+    return await run_command(command)
 
 
 @tool(
@@ -62,4 +62,4 @@ async def check_suid(command: str = 'find / -perm -4000 -type f 2>/dev/null') ->
     phases=['privesc'],
 )
 async def check_cron(command: str = 'cat /etc/crontab; ls -la /etc/cron.d/ 2>/dev/null; crontab -l 2>/dev/null') -> str:
-    return await run_command(['bash', '-c', command])
+    return await run_command(command)

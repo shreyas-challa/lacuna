@@ -15,10 +15,7 @@ from backend.tools.base import tool, run_command
     phases=['vuln_analysis'],
 )
 async def nuclei_scan(target: str, flags: str = '') -> str:
-    cmd = ['nuclei', '-u', target, '-nc']
-    if flags:
-        cmd += flags.split()
-    return await run_command(cmd, timeout=300)
+    return await run_command(f'nuclei -u {target} -nc {flags}', timeout=300)
 
 
 @tool(
@@ -34,7 +31,7 @@ async def nuclei_scan(target: str, flags: str = '') -> str:
     phases=['vuln_analysis'],
 )
 async def searchsploit(query: str) -> str:
-    return await run_command(['searchsploit', query])
+    return await run_command(f'searchsploit {query}')
 
 
 @tool(
@@ -51,7 +48,4 @@ async def searchsploit(query: str) -> str:
     phases=['vuln_analysis'],
 )
 async def nikto_scan(target: str, flags: str = '') -> str:
-    cmd = ['nikto', '-h', target]
-    if flags:
-        cmd += flags.split()
-    return await run_command(cmd, timeout=300)
+    return await run_command(f'nikto -h {target} {flags}', timeout=300)

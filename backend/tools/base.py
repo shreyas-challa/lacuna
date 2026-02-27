@@ -1,5 +1,4 @@
 import asyncio
-import shlex
 from typing import Callable
 
 # Global tool registry: name -> {function, schema, phases}
@@ -24,7 +23,6 @@ def tool(name: str, description: str, parameters: dict, phases: list[str]):
 
 def get_tools_for_phase(phase: str) -> list[dict]:
     """Get OpenAI-format tool schemas available for a given phase."""
-    # Tools from earlier phases remain available
     phase_order = ['enumeration', 'vuln_analysis', 'exploitation', 'privesc']
     current_idx = phase_order.index(phase) if phase in phase_order else 0
     available_phases = phase_order[:current_idx + 1]
@@ -43,11 +41,11 @@ def get_tools_for_phase(phase: str) -> list[dict]:
     return tools
 
 
-async def run_command(cmd: list[str], timeout: int = TIMEOUT) -> str:
-    """Execute a subprocess command with timeout and output cap."""
+async def run_command(cmd: str, timeout: int = TIMEOUT) -> str:
+    """Execute a shell command string with timeout and output cap."""
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -62,7 +60,5 @@ async def run_command(cmd: list[str], timeout: int = TIMEOUT) -> str:
         if len(output) > OUTPUT_CAP:
             output = output[:OUTPUT_CAP] + f"\n\n[OUTPUT TRUNCATED at {OUTPUT_CAP} bytes]"
         return output
-    except FileNotFoundError:
-        return f"[ERROR] Command not found: {cmd[0]}"
     except Exception as e:
         return f"[ERROR] {str(e)}"
