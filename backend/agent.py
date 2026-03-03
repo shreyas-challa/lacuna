@@ -171,6 +171,35 @@ def parse_command_output_for_graph(output: str, target: str) -> dict:
     return {'nodes': nodes, 'edges': edges}
 
 
+TOOL_HINTS = {
+    'nmap_scan': 'HINT: Check the target IP is correct and reachable. Try fewer ports (-p 80,443) or a lighter scan (-sT) instead of a full scan.',
+    'gobuster_dir': 'HINT: Verify the URL scheme (http vs https) and that the web server is running. Try a smaller wordlist or different URL path.',
+    'ffuf_fuzz': 'HINT: Ensure the URL contains the FUZZ keyword. Check the target is responding. Try filtering by response size (-fs) or status code (-fc).',
+    'whatweb_scan': 'HINT: Verify the target URL/IP is correct. Try using http:// or https:// explicitly.',
+    'curl_request': 'HINT: Check the URL is well-formed and the service is up. Try adding -v for verbose output or -k to skip TLS verification.',
+    'download_and_analyze': 'HINT: Verify the download URL is correct and the file exists. Check HTTP response code. Try curl_request first to confirm the URL works.',
+    'execute_command': 'HINT: Check command syntax. If running remote commands via SSH, verify credentials and connectivity first.',
+    'nuclei_scan': 'HINT: Ensure the target URL is correct. Try with specific templates (-t) instead of full scan. Check if nuclei templates are installed.',
+    'searchsploit': 'HINT: Simplify the search query — use just the software name and version (e.g. "Apache 2.4.49"). Avoid special characters.',
+    'nikto_scan': 'HINT: Verify the target URL is correct and the web server is responding. Try with -ssl flag if HTTPS.',
+    'msfconsole_run': 'HINT: Check module path and options. Ensure RHOSTS/RHOST, LHOST, LPORT are set. Use semicolons between commands.',
+    'setup_listener': 'HINT: Ensure the port is not already in use. Try a different port.',
+    'send_payload': 'HINT: Verify the delivery command syntax and target endpoint. Ensure listener is set up before sending.',
+    'run_linpeas': 'HINT: Ensure you have shell access on the target first. Try downloading linpeas to /tmp on the target.',
+    'check_sudo': 'HINT: Ensure you have a shell on the target. You may need a password — try with credentials found earlier.',
+    'check_suid': 'HINT: Ensure you have shell access on the target. This command must run on the remote system, not locally.',
+    'check_cron': 'HINT: Ensure you have shell access on the target. Check /etc/crontab and /var/spool/cron/ manually.',
+}
+
+
+def _add_tool_hint(name: str, args: dict, error_msg: str) -> str:
+    """Append a tool-specific corrective hint to an error message."""
+    hint = TOOL_HINTS.get(name, 'HINT: Try a different approach or tool. Do not repeat the same call.')
+    if 'TIMEOUT' in error_msg:
+        hint = f'HINT: Command timed out. Try a faster/lighter variant or reduce scope. {hint.replace("HINT: ", "Also: ")}'
+    return f"{error_msg} {hint}"
+
+
 class Agent:
     def __init__(self, target: str, manager: WSManager):
         self.target = target
@@ -185,6 +214,10 @@ class Agent:
         self.total_output_tokens = 0
         self.logger = SessionLogger(target)
         self._done = False  # signals agent should stop entirely
+        self._tool_cache: dict[str, str] = {}  # key: "name|args_json" -> cached result
+        self._tool_call_count = 0  # total tool calls made (for budget tracking)
+        self._phase_entry_iteration = 0  # iteration when current phase started
+        self._phase_entry_node_count = 0  # graph node count when current phase started
 
     def _build_system_prompt(self) -> str:
         system = load_prompt("system.md")
@@ -215,6 +248,8 @@ class Agent:
         })
 
         L.log(f"{C_MAGENTA}Phase: ENUMERATION{C_RESET}")
+        self._phase_entry_iteration = 0
+        self._phase_entry_node_count = len(self.graph.nodes)
 
         while self.phase != 'complete' and self.total_iterations < MAX_TOTAL_ITERATIONS and not self._done:
             phase_iterations = 0
@@ -223,6 +258,19 @@ class Agent:
             while phase_iterations < MAX_ITERATIONS_PER_PHASE and self.total_iterations < MAX_TOTAL_ITERATIONS:
                 self.total_iterations += 1
                 phase_iterations += 1
+
+                # Phase stagnation nudge: if 8+ iterations in same phase with no new graph nodes
+                iters_in_phase = self.total_iterations - self._phase_entry_iteration
+                new_nodes = len(self.graph.nodes) - self._phase_entry_node_count
+                if iters_in_phase > 8 and new_nodes == 0:
+                    nudge = (
+                        f"[SYSTEM] You have been in the '{self.phase}' phase for {iters_in_phase} iterations "
+                        f"without discovering new information (no new graph nodes). Either transition to the next "
+                        f"phase with transition_phase, or explain what specific information you are still looking for "
+                        f"and why previous attempts failed."
+                    )
+                    self.messages.append({'role': 'user', 'content': nudge})
+                    L.log(f"{C_YELLOW}Phase stagnation nudge injected (iter {iters_in_phase}, 0 new nodes){C_RESET}")
 
                 L.log(f"{C_DIM}--- Iteration {self.total_iterations}/{MAX_TOTAL_ITERATIONS} (phase: {phase_iterations}/{MAX_ITERATIONS_PER_PHASE}) ---{C_RESET}")
 
@@ -286,6 +334,8 @@ class Agent:
                         current_idx = PHASES.index(self.phase) if self.phase in PHASES else len(PHASES) - 1
                         if current_idx < len(PHASES) - 1:
                             self.phase = PHASES[current_idx + 1]
+                            self._phase_entry_iteration = self.total_iterations
+                            self._phase_entry_node_count = len(self.graph.nodes)
                             L.log(f"{C_MAGENTA}Auto-advancing to {self.phase.upper()} (model stopped){C_RESET}")
                             await self.manager.broadcast('phase_change', {'phase': self.phase})
                         else:
@@ -319,9 +369,20 @@ class Agent:
 
                     await self.manager.broadcast('tool_call', {'id': call_id, 'name': name, 'args': args})
 
-                    tool_start = time.time()
-                    result = await self._execute_tool(name, args)
-                    tool_time = time.time() - tool_start
+                    # Deduplication: check if exact same call was already made
+                    cache_key = f"{name}|{json.dumps(args, sort_keys=True)}"
+                    if cache_key in self._tool_cache:
+                        result = f"[CACHED - already ran this exact call] {self._tool_cache[cache_key]}"
+                        tool_time = 0.0
+                        L.log(f"{C_YELLOW}Cache hit for {name} — returning cached result{C_RESET}")
+                    else:
+                        self._tool_call_count += 1
+                        tool_start = time.time()
+                        result = await self._execute_tool(name, args)
+                        tool_time = time.time() - tool_start
+                        # Cache the result (skip meta-tools and errors that might be transient)
+                        if name not in ('transition_phase', 'append_report', 'update_graph'):
+                            self._tool_cache[cache_key] = result
 
                     result_lines = result.count('\n') + 1
                     L.log(f"{C_GREEN}Tool done: {name} | {tool_time:.1f}s | {len(result)} chars, {result_lines} lines{C_RESET}")
@@ -360,6 +421,10 @@ class Agent:
                             self._done = True
                         elif next_phase in PHASES:
                             self.phase = next_phase
+
+                        # Reset phase stagnation tracking
+                        self._phase_entry_iteration = self.total_iterations
+                        self._phase_entry_node_count = len(self.graph.nodes)
 
                         L.log(f"\n{C_MAGENTA}{'='*40}{C_RESET}")
                         L.log(f"{C_MAGENTA}Phase: {self.phase.upper()}{C_RESET}")
@@ -420,11 +485,16 @@ class Agent:
                         valid_args['url'] = f'http://{self.target}'
                         L.log(f"{C_YELLOW}Injected missing: url=http://{self.target}{C_RESET}")
             try:
-                return await func(**valid_args)
+                result = await func(**valid_args)
+                # Check for tool-level errors in output and add hints
+                if result.startswith('[ERROR]') or result.startswith('[TIMEOUT'):
+                    result = _add_tool_hint(name, args, result)
+                return result
             except Exception as e:
-                return f"[ERROR] Tool {name} failed: {str(e)}"
+                error_msg = f"[ERROR] {name} failed: {str(e)}"
+                return _add_tool_hint(name, args, error_msg)
 
-        return f"[ERROR] Unknown tool: {name}"
+        return f"[ERROR] Unknown tool: {name}. HINT: Check available tools for this phase — you may need to transition_phase first."
 
     async def _broadcast_graph(self):
         await self.manager.broadcast('graph_update', self.graph.get_state())
