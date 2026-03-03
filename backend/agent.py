@@ -9,6 +9,7 @@ from backend.graph import GraphManager
 from backend.report import ReportBuilder
 from backend.ws_manager import WSManager
 from backend.tools import TOOL_REGISTRY, get_tools_for_phase
+from backend.tools.exploitation import set_lhost
 from backend.parsers import TOOL_PARSERS
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -201,8 +202,9 @@ def _add_tool_hint(name: str, args: dict, error_msg: str) -> str:
 
 
 class Agent:
-    def __init__(self, target: str, manager: WSManager):
+    def __init__(self, target: str, manager: WSManager, lhost: str = ''):
         self.target = target
+        self.lhost = lhost
         self.manager = manager
         self.graph = GraphManager()
         self.report = ReportBuilder(target)
@@ -223,7 +225,8 @@ class Agent:
         system = load_prompt("system.md")
         phase_prompt = load_prompt(f"{self.phase}.md")
         graph_summary = self.graph.get_summary()
-        return f"{system}\n\n## Current Phase: {self.phase}\n\n{phase_prompt}\n\n## Current Graph State\n{graph_summary}\n\n## Target: {self.target}"
+        lhost_section = f"\n\n## Attacker IP (LHOST): {self.lhost}" if self.lhost else ""
+        return f"{system}\n\n## Current Phase: {self.phase}\n\n{phase_prompt}\n\n## Current Graph State\n{graph_summary}\n\n## Target: {self.target}{lhost_section}"
 
     def _get_tools(self) -> list[dict]:
         phase_tools = get_tools_for_phase(self.phase)
@@ -232,9 +235,14 @@ class Agent:
     async def run(self):
         L = self.logger
 
+        if self.lhost:
+            set_lhost(self.lhost)
+
         L.header(f"\n{C_BOLD}{C_BLUE}{'='*60}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  LACUNA — Security Research Agent{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Target: {self.target}{C_RESET}")
+        if self.lhost:
+            L.header(f"{C_BOLD}{C_BLUE}  LHOST: {self.lhost}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Log: {L.log_path}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}{'='*60}{C_RESET}\n")
 
@@ -481,6 +489,9 @@ class Agent:
                     if param_name == 'target':
                         valid_args['target'] = self.target
                         L.log(f"{C_YELLOW}Injected missing: target={self.target}{C_RESET}")
+                    elif param_name == 'lhost' and self.lhost:
+                        valid_args['lhost'] = self.lhost
+                        L.log(f"{C_YELLOW}Injected missing: lhost={self.lhost}{C_RESET}")
                     elif param_name == 'url':
                         valid_args['url'] = f'http://{self.target}'
                         L.log(f"{C_YELLOW}Injected missing: url=http://{self.target}{C_RESET}")

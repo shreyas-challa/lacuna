@@ -3,6 +3,7 @@
 (() => {
   const startBtn = document.getElementById('start-btn');
   const targetInput = document.getElementById('target-input');
+  const lhostInput = document.getElementById('lhost-input');
   const phaseLabel = document.getElementById('phase-label');
   let ws = null;
 
@@ -21,17 +22,19 @@
 
   startBtn.addEventListener('click', () => {
     const target = targetInput.value.trim();
+    const lhost = lhostInput.value.trim();
     if (!target) return;
 
     startBtn.disabled = true;
     targetInput.disabled = true;
+    lhostInput.disabled = true;
     phaseLabel.textContent = 'CONNECTING...';
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws`);
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ target }));
+      ws.send(JSON.stringify({ target, lhost }));
       phaseLabel.textContent = 'STARTING';
     };
 
@@ -44,12 +47,14 @@
       phaseLabel.textContent = 'DISCONNECTED';
       startBtn.disabled = false;
       targetInput.disabled = false;
+      lhostInput.disabled = false;
     };
 
     ws.onerror = () => {
       phaseLabel.textContent = 'ERROR';
       startBtn.disabled = false;
       targetInput.disabled = false;
+      lhostInput.disabled = false;
     };
   });
 
@@ -83,6 +88,7 @@
         phaseLabel.textContent = 'COMPLETE';
         startBtn.disabled = false;
         targetInput.disabled = false;
+        lhostInput.disabled = false;
         break;
 
       case 'error':

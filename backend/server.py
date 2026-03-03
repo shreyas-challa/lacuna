@@ -21,11 +21,12 @@ async def websocket_endpoint(ws: WebSocket):
         # Wait for the start command with target info
         data = await ws.receive_json()
         target = data.get("target", "")
+        lhost = data.get("lhost", "")
         if not target:
             await ws.send_json({"type": "error", "data": {"message": "No target provided"}})
             return
 
-        agent = Agent(target=target, manager=manager)
+        agent = Agent(target=target, lhost=lhost, manager=manager)
         await agent.run()
     except WebSocketDisconnect:
         pass
