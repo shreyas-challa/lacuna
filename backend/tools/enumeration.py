@@ -2,7 +2,41 @@ import os
 from backend.tools.base import tool, run_command
 from backend.knowledge import query_knowledge_base
 
-WORDLIST = os.path.join(os.path.dirname(__file__), '..', '..', 'wordlists', 'common.txt')
+# ── Wordlist paths (order of preference) ──────────────────────
+_WORDLIST_SEARCH_PATHS = {
+    'common': [
+        '/usr/share/seclists/Discovery/Web-Content/common.txt',
+        '/usr/share/wordlists/dirb/common.txt',
+        '/usr/share/wordlists/common.txt',
+        '/usr/share/dirb/wordlists/common.txt',
+    ],
+    'medium': [
+        '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt',
+        '/usr/share/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt',
+        '/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt',
+    ],
+    'big': [
+        '/usr/share/seclists/Discovery/Web-Content/big.txt',
+        '/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt',
+    ],
+    'raft': [
+        '/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt',
+        '/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt',
+    ],
+    'subdomains': [
+        '/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt',
+        '/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt',
+    ],
+}
+
+def _find_wordlist(name: str = 'common') -> str | None:
+    """Find the first existing wordlist file for a given category."""
+    for path in _WORDLIST_SEARCH_PATHS.get(name, []):
+        if os.path.isfile(path):
+            return path
+    return None
+
+DEFAULT_WORDLIST = _find_wordlist('common') or '/usr/share/seclists/Discovery/Web-Content/common.txt'
 
 
 @tool(
@@ -24,12 +58,15 @@ async def nmap_scan(target: str, flags: str = '-sV -sC') -> str:
 
 @tool(
     name='gobuster_dir',
-    description='Run gobuster directory brute-force against a target URL.',
+    description='Run gobuster directory brute-force against a target URL. '
+                'Available wordlists: "common" (4750 words, default), "medium" (220k words), '
+                '"big" (227k words), "raft" (raft-medium-directories). '
+                'Pass the keyword or leave empty for common.txt. Custom paths also accepted.',
     parameters={
         'type': 'object',
         'properties': {
             'url': {'type': 'string', 'description': 'Target URL (e.g. http://10.10.10.1)'},
-            'wordlist': {'type': 'string', 'description': 'Wordlist path (default: bundled common.txt)', 'default': ''},
+            'wordlist': {'type': 'string', 'description': 'Wordlist: "common", "medium", "big", "raft", or full path. Default: common', 'default': ''},
             'flags': {'type': 'string', 'description': 'Additional gobuster flags', 'default': ''},
         },
         'required': ['url'],
@@ -38,17 +75,33 @@ async def nmap_scan(target: str, flags: str = '-sV -sC') -> str:
 )
 async def gobuster_dir(url: str, wordlist: str = '', flags: str = '') -> str:
     wl = _resolve_wordlist(wordlist)
-    return await run_command(f'gobuster dir -u {url} -w {wl} {flags}', timeout=300)
+    # Auto-add --wildcard and --no-error to handle wildcard responses gracefully
+    base_flags = '--no-error -q'
+    # If user didn't specify status codes, exclude 301 redirects to avoid wildcard noise
+    if '-s ' not in flags and '--status-codes' not in flags:
+        base_flags += ' -b 404'
+    result = await run_command(f'gobuster dir -u {url} -w {wl} {base_flags} {flags}', timeout=300)
+    # Detect gobuster wildcard/error abort
+    if 'the server returns a status code that matches' in result or 'Wildcard response found' in result.lower():
+        return (
+            f"[ERROR] Gobuster detected wildcard responses — the server returns the same status code "
+            f"for non-existent URLs, making directory brute-forcing unreliable. "
+            f"Try ffuf_fuzz with filter flags (e.g. -fs to filter by response size) or "
+            f"use curl_request to manually probe specific paths instead."
+        )
+    return result
 
 
 @tool(
     name='ffuf_fuzz',
-    description='Run ffuf for web fuzzing (directories, parameters, vhosts).',
+    description='Run ffuf for web fuzzing (directories, parameters, vhosts). '
+                'Available wordlists: "common" (4750 words, default), "medium" (220k words), '
+                '"big", "raft", "subdomains". Pass keyword or full path.',
     parameters={
         'type': 'object',
         'properties': {
             'url': {'type': 'string', 'description': 'Target URL with FUZZ keyword (e.g. http://10.10.10.1/FUZZ)'},
-            'wordlist': {'type': 'string', 'description': 'Wordlist path (default: bundled common.txt)', 'default': ''},
+            'wordlist': {'type': 'string', 'description': 'Wordlist: "common", "medium", "big", "raft", "subdomains", or full path. Default: common', 'default': ''},
             'flags': {'type': 'string', 'description': 'Additional ffuf flags', 'default': ''},
         },
         'required': ['url'],
@@ -57,7 +110,11 @@ async def gobuster_dir(url: str, wordlist: str = '', flags: str = '') -> str:
 )
 async def ffuf_fuzz(url: str, wordlist: str = '', flags: str = '') -> str:
     wl = _resolve_wordlist(wordlist)
-    return await run_command(f'ffuf -u {url} -w {wl} -c {flags}', timeout=300)
+    # Auto-calibrate to filter wildcard responses unless user specified filters
+    auto_flags = '-c -noninteractive'
+    if '-fc' not in flags and '-fs' not in flags and '-ac' not in flags:
+        auto_flags += ' -ac'  # auto-calibrate: ffuf detects and filters wildcard sizes
+    return await run_command(f'ffuf -u {url} -w {wl} {auto_flags} {flags}', timeout=300)
 
 
 @tool(
@@ -169,6 +226,10 @@ async def download_and_analyze(url: str, filename: str) -> str:
     phases=['enumeration'],
 )
 async def execute_command_enum(command: str) -> str:
+    # Reject hallucinated non-commands (LLM sometimes outputs text instead of a real command)
+    cmd_stripped = command.strip()
+    if not cmd_stripped or cmd_stripped.startswith('[') or cmd_stripped.startswith('{'):
+        return "[ERROR] Invalid command — this is not a shell command. Use a real shell command or a dedicated tool."
     return await run_command(command)
 
 
@@ -195,11 +256,39 @@ async def query_kb(query: str, category: str = 'all') -> str:
 
 
 def _resolve_wordlist(wordlist: str) -> str:
-    """Resolve wordlist path, falling back to bundled common.txt."""
+    """Resolve wordlist path with intelligent fallback.
+
+    1. If the exact path exists, use it.
+    2. If the path looks like a known category name, find the best match.
+    3. If the path doesn't exist, try common SecLists locations.
+    4. Fall back to the default common.txt.
+    """
+    # Exact path exists
     if wordlist and os.path.isfile(wordlist):
         return wordlist
-    # Fall back to bundled wordlist
-    bundled = os.path.abspath(WORDLIST)
-    if os.path.isfile(bundled):
-        return bundled
-    return '/usr/share/wordlists/dirb/common.txt'
+
+    if wordlist:
+        # Direct category keyword (e.g. "common", "medium", "big")
+        wl_lower = wordlist.strip().lower()
+        if wl_lower in _WORDLIST_SEARCH_PATHS:
+            found = _find_wordlist(wl_lower)
+            if found:
+                return found
+
+        # Try to match against known category keywords in path
+        for category in ('medium', 'big', 'raft', 'subdomains', 'common'):
+            if category in wl_lower:
+                found = _find_wordlist(category)
+                if found:
+                    return found
+
+        # Try common SecLists base path corrections
+        # e.g. LLM asks for /usr/share/seclists/Discovery/Web-Content/common.txt
+        # but actual file is at a slightly different path
+        basename = os.path.basename(wordlist)
+        seclists_web = '/usr/share/seclists/Discovery/Web-Content'
+        candidate = os.path.join(seclists_web, basename)
+        if os.path.isfile(candidate):
+            return candidate
+
+    return DEFAULT_WORDLIST
