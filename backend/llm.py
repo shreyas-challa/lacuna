@@ -1,9 +1,10 @@
-"""LLM client — OpenAI API, Codex OAuth, Anthropic OAuth with auto-fallback.
+"""LLM client — OpenAI API, Codex OAuth, Anthropic OAuth, MiniMax with auto-fallback.
 
-Supports three backends:
+Supports four backends:
   - openai: Standard OpenAI API with API key ($OPENAI_API_KEY)
   - codex: ChatGPT/Codex OAuth — piggybacks off Codex CLI session (~/.codex/auth.json)
   - anthropic: Anthropic API key or Claude Code OAuth (~/.claude/.credentials.json)
+  - minimax: MiniMax API with API key ($MINIMAX_API_KEY) — OpenAI-compatible endpoint
 
 Auto-detection picks the first available backend based on credentials.
 Auto-fallback transparently switches when a backend hits quota/rate limits.
@@ -23,6 +24,7 @@ load_dotenv()
 OPENAI_MODEL = os.getenv("LACUNA_MODEL", "gpt-4.1-mini")
 CODEX_MODEL = os.getenv("LACUNA_CODEX_MODEL", "") or "gpt-5.1-codex-mini"
 ANTHROPIC_MODEL = os.getenv("LACUNA_ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+MINIMAX_MODEL = os.getenv("LACUNA_MINIMAX_MODEL", "MiniMax-M2.7")
 FALLBACK_ENABLED = os.getenv("LACUNA_FALLBACK", "true").lower() in ("true", "1", "yes")
 
 MAX_RETRIES = 3
@@ -32,6 +34,7 @@ _MODEL_FOR_BACKEND = {
     "openai": OPENAI_MODEL,
     "codex": CODEX_MODEL,
     "anthropic": ANTHROPIC_MODEL,
+    "minimax": MINIMAX_MODEL,
 }
 
 # ── Backend auto-detection ───────────────────────────────────────
@@ -51,6 +54,8 @@ def _detect_backend() -> str:
         return "openai"
     if _codex_creds_exist():
         return "codex"
+    if os.getenv("MINIMAX_API_KEY"):
+        return "minimax"
     if os.getenv("ANTHROPIC_API_KEY") or (Path.home() / ".claude" / ".credentials.json").exists():
         return "anthropic"
     return "openai"  # will fail with helpful error
@@ -74,6 +79,9 @@ MODEL_PRICING = {
     'claude-opus-4':   {'input': 15.00, 'output': 75.00, 'cached_input': 1.875},
     'claude-sonnet-4': {'input': 3.00,  'output': 15.00, 'cached_input': 0.375},
     'claude-haiku-4':  {'input': 0.80,  'output': 4.00,  'cached_input': 0.10},
+    # MiniMax
+    'MiniMax-M2.7':    {'input': 0.30,  'output': 1.20,  'cached_input': 0.075},
+    'MiniMax-M2.5':    {'input': 0.30,  'output': 1.20,  'cached_input': 0.075},
 }
 
 
@@ -96,11 +104,13 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int,
 _active_backend = BACKEND
 _codex_auth = None       # CodexAuth instance (lazy)
 _anthropic_client = None  # Anthropic client (lazy)
+_minimax_client = None   # MiniMax AsyncOpenAI client (lazy)
 
 _FALLBACK_ORDER = {
-    "openai": ["codex", "anthropic"],
-    "codex": ["anthropic", "openai"],
-    "anthropic": ["openai", "codex"],
+    "openai": ["codex", "minimax", "anthropic"],
+    "codex": ["minimax", "anthropic", "openai"],
+    "anthropic": ["openai", "minimax", "codex"],
+    "minimax": ["codex", "anthropic", "openai"],
 }
 
 
@@ -116,7 +126,7 @@ def get_active_backend() -> str:
 
 def get_client():
     """Create primary API client. Returns None for codex (uses httpx internally)."""
-    global _codex_auth
+    global _codex_auth, _minimax_client
     if BACKEND == "openai":
         from openai import AsyncOpenAI
         api_key = os.getenv("OPENAI_API_KEY")
@@ -126,6 +136,9 @@ def get_client():
     elif BACKEND == "codex":
         _codex_auth = CodexAuth()
         return None  # codex uses httpx directly
+    elif BACKEND == "minimax":
+        _minimax_client = _get_minimax_client()
+        return None  # minimax uses its own client
     else:
         return _get_anthropic_client()
 
@@ -148,6 +161,21 @@ def _get_anthropic_client():
         "No Anthropic credentials found. Either:\n"
         "  1. Set ANTHROPIC_API_KEY in .env\n"
         "  2. Log in to Claude Code (claude login) to use OAuth"
+    )
+
+
+def _get_minimax_client():
+    """Create MiniMax client using OpenAI SDK with MiniMax base URL."""
+    from openai import AsyncOpenAI
+    api_key = os.getenv("MINIMAX_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "MINIMAX_API_KEY not set. Add it to .env\n"
+            "Get your key at: https://platform.minimax.io/"
+        )
+    return AsyncOpenAI(
+        api_key=api_key,
+        base_url="https://api.minimax.io/v1",
     )
 
 
@@ -177,7 +205,7 @@ async def chat_completion(client, messages: list, tools: list | None = None):
 
 
 async def _dispatch(backend: str, client, messages, tools):
-    global _codex_auth, _anthropic_client
+    global _codex_auth, _anthropic_client, _minimax_client
     if backend == "openai":
         if client is None:
             from openai import AsyncOpenAI
@@ -190,6 +218,10 @@ async def _dispatch(backend: str, client, messages, tools):
         if not _codex_auth:
             _codex_auth = CodexAuth()
         return await _codex_completion(messages, tools)
+    elif backend == "minimax":
+        if not _minimax_client:
+            _minimax_client = _get_minimax_client()
+        return await _minimax_completion(_minimax_client, messages, tools)
     else:
         if not _anthropic_client:
             _anthropic_client = _get_anthropic_client()
@@ -202,7 +234,7 @@ def _is_switchable_error(e: Exception) -> bool:
         'insufficient_quota', 'billing', 'rate_limit',
         '429', 'quota', 'exceeded',
         'no codex credentials', 'no anthropic credentials',
-        'no openai api key',
+        'no openai api key', 'minimax_api_key not set',
     ))
 
 
@@ -213,6 +245,39 @@ def _is_switchable_error(e: Exception) -> bool:
 async def _openai_completion(client, messages: list, tools: list | None):
     kwargs = {
         'model': OPENAI_MODEL,
+        'messages': messages,
+        'max_tokens': 4096,
+    }
+    if tools:
+        kwargs['tools'] = tools
+        kwargs['tool_choice'] = 'auto'
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            last_error = e
+            error_str = str(e).lower()
+            if any(x in error_str for x in ('auth', '401', '400', 'invalid_api_key')):
+                raise
+            if _is_switchable_error(e):
+                raise
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAYS[attempt])
+    raise last_error
+
+
+# ═════════════════════════════════════════════════════════════════
+#  MiniMax backend (OpenAI-compatible API)
+# ═════════════════════════════════════════════════════════════════
+
+MINIMAX_BASE_URL = "https://api.minimax.io/v1"
+
+async def _minimax_completion(client, messages: list, tools: list | None):
+    """MiniMax uses OpenAI-compatible chat completions — same format, different model."""
+    kwargs = {
+        'model': MINIMAX_MODEL,
         'messages': messages,
         'max_tokens': 4096,
     }
