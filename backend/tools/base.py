@@ -1,4 +1,5 @@
 import asyncio
+import re
 from typing import Callable
 
 # Global tool registry: name -> {function, schema, phases}
@@ -58,7 +59,19 @@ async def run_command(cmd: str, timeout: int = TIMEOUT) -> str:
 
         output = stdout.decode('utf-8', errors='replace')
         if len(output) > OUTPUT_CAP:
-            output = output[:OUTPUT_CAP] + f"\n\n[TRUNCATED at {OUTPUT_CAP} bytes]"
+            # For HTML output, extract key links from the FULL output before truncating
+            suffix = f"\n\n[TRUNCATED at {OUTPUT_CAP} bytes]"
+            if '<html' in output[:500].lower() or '<head' in output[:500].lower():
+                links = set()
+                for m in re.finditer(r'href=["\']([^"\']+)["\']', output, re.IGNORECASE):
+                    href = m.group(1)
+                    if href and href != '#' and not href.startswith(('javascript:', 'mailto:')):
+                        links.add(href)
+                if links:
+                    # Deduplicate and limit, prioritize interesting paths
+                    sorted_links = sorted(links)[:30]
+                    suffix = f"\n\n[TRUNCATED at {OUTPUT_CAP} bytes — all href links: {', '.join(sorted_links)}]"
+            output = output[:OUTPUT_CAP] + suffix
         return output
     except Exception as e:
         return f"[ERROR] {str(e)}"

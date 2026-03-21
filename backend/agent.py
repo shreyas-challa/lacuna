@@ -615,13 +615,36 @@ class Agent:
             if self.state.add_web_asset('api_endpoints', m.group(1)):
                 added += 1
 
+        # Anchor hrefs with download/file/export paths (catch /download/N, /file/X, etc.)
+        for m in re.finditer(r'href=["\']([^"\']*(?:/download/|/file/|/export/|/raw/|/pcap/|\.pcap)[^"\']*)["\']', result, re.IGNORECASE):
+            link = m.group(1)
+            if link and link != '#':
+                if self.state.add_web_asset('api_endpoints', link):
+                    added += 1
+
         if added:
             L.log(f"{C_CYAN}Auto-extracted {added} web asset(s) into state{C_RESET}")
 
     # ── IDOR pattern detection ──────────────────────────────────
 
+    # Common sibling path patterns for IDOR detection
+    _IDOR_SIBLING_PATHS = {
+        '/data/': ['/download/', '/export/', '/file/', '/raw/'],
+        '/download/': ['/data/', '/view/', '/file/'],
+        '/view/': ['/download/', '/data/', '/raw/'],
+        '/file/': ['/download/', '/data/'],
+        '/capture/': ['/download/', '/data/', '/pcap/'],
+        '/report/': ['/download/', '/export/'],
+        '/export/': ['/download/', '/data/'],
+        '/user/': ['/profile/', '/account/'],
+        '/profile/': ['/user/', '/account/'],
+    }
+
     def _check_idor_pattern(self, url: str, result: str):
-        """Detect numeric ID patterns in URLs and suggest trying other IDs (especially 0)."""
+        """Detect numeric ID patterns in URLs and suggest trying other IDs (especially 0).
+
+        Also suggests common sibling paths (e.g. /download/N when /data/N is found).
+        """
         L = self.logger
         # Match URLs like /data/1, /download/2, /user/3, /api/items/5, etc.
         m = re.search(r'(https?://[^/]+)?(/[^?#\s]*?/)(\d+)(?:[?#\s]|$)', url)
@@ -636,6 +659,8 @@ class Agent:
             return
         setattr(self, idor_key, True)
 
+        host_prefix = m.group(1) or ''
+
         # Build suggestion list: always try 0, and try adjacent IDs
         try_ids = set()
         if current_id != 0:
@@ -645,17 +670,43 @@ class Agent:
         try_ids.add(current_id + 1)
         try_ids.discard(current_id)
 
+        # Build sibling path suggestions
+        sibling_suggestions = []
+        for pattern, siblings in self._IDOR_SIBLING_PATHS.items():
+            if base_path == pattern:
+                for sibling in siblings:
+                    sibling_suggestions.append(f"{host_prefix}{sibling}{current_id}")
+                    if current_id != 0:
+                        sibling_suggestions.append(f"{host_prefix}{sibling}0")
+                break
+
+        nudge_parts = [
+            f"[SYSTEM] The URL {url} contains a numeric ID ({current_id}). "
+            f"This is a potential IDOR (Insecure Direct Object Reference)."
+        ]
+
         if try_ids:
-            id_suggestions = ', '.join(str(i) for i in sorted(try_ids))
-            host_prefix = m.group(1) or ''
-            nudge = (
-                f"[SYSTEM] The URL {url} contains a numeric ID ({current_id}). "
-                f"This is a potential IDOR (Insecure Direct Object Reference). "
-                f"Try accessing other IDs — especially: {', '.join(f'{host_prefix}{base_path}{i}' for i in sorted(try_ids))}. "
-                f"ID 0 often contains pre-existing data (captures, profiles, records) from other users."
+            id_urls = ', '.join(f'{host_prefix}{base_path}{i}' for i in sorted(try_ids))
+            nudge_parts.append(f"Try other IDs: {id_urls}. ID 0 often contains pre-existing data from other users.")
+
+        if sibling_suggestions:
+            nudge_parts.append(
+                f"Also try related endpoints: {', '.join(sibling_suggestions[:6])}. "
+                f"Web apps often have separate /data/ (view) and /download/ (file) endpoints."
             )
-            self.messages.append({'role': 'user', 'content': nudge, '_iteration': self._iteration_counter})
-            L.log(f"{C_CYAN}IDOR pattern detected: {base_path}{current_id} → suggesting IDs: {id_suggestions}{C_RESET}")
+
+        # Also extract any download/file links from the HTML result
+        download_links = set()
+        for dm in re.finditer(r'href=["\']([^"\']*(?:download|file|export|raw|pcap)[^"\']*)["\']', result, re.IGNORECASE):
+            link = dm.group(1)
+            if link and link != '#':
+                download_links.add(link)
+        if download_links:
+            nudge_parts.append(f"Found download links in page: {', '.join(sorted(download_links)[:5])}")
+
+        nudge = '\n'.join(nudge_parts)
+        self.messages.append({'role': 'user', 'content': nudge, '_iteration': self._iteration_counter})
+        L.log(f"{C_CYAN}IDOR pattern detected: {base_path}{current_id} → IDs: {sorted(try_ids)}, siblings: {sibling_suggestions[:4]}{C_RESET}")
 
     # ── Budget broadcasting ──────────────────────────────────────
 
