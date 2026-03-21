@@ -4,7 +4,7 @@ from typing import Callable
 # Global tool registry: name -> {function, schema, phases}
 TOOL_REGISTRY: dict[str, dict] = {}
 
-OUTPUT_CAP = 15 * 1024  # 15KB max output
+OUTPUT_CAP = 8 * 1024  # 8KB max output (was 15KB — saves ~7KB per tool call in context)
 TIMEOUT = 120  # seconds
 
 
@@ -58,7 +58,7 @@ async def run_command(cmd: str, timeout: int = TIMEOUT) -> str:
 
         output = stdout.decode('utf-8', errors='replace')
         if len(output) > OUTPUT_CAP:
-            output = output[:OUTPUT_CAP] + f"\n\n[OUTPUT TRUNCATED at {OUTPUT_CAP} bytes]"
+            output = output[:OUTPUT_CAP] + f"\n\n[TRUNCATED at {OUTPUT_CAP} bytes]"
         return output
     except Exception as e:
         return f"[ERROR] {str(e)}"

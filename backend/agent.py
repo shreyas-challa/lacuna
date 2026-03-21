@@ -15,7 +15,7 @@ import inspect
 from pathlib import Path
 from datetime import datetime
 
-from backend.llm import get_client, chat_completion
+from backend.llm import get_client, chat_completion, extract_usage, MODEL
 from backend.graph import GraphManager
 from backend.report import ReportBuilder
 from backend.ws_manager import WSManager
@@ -202,33 +202,45 @@ class Agent:
         self._phase_entry_node_count = 0
         self._last_nudge_iteration = -99
         self._knowledge_injected: set[str] = set()
+        self.total_cost = 0.0  # estimated USD spend
+        self.total_cached_tokens = 0
+        self._tool_failures: dict[str, int] = {}  # tool_name -> consecutive failure count
 
     # ── System prompt construction ───────────────────────────────
+    # Structured for OpenAI prompt caching: static prefix first, dynamic state last.
+    # OpenAI caches the matching prefix at 50% off — the static instructions are
+    # the same across all calls within a phase, so they get cached automatically.
 
     def _build_system_prompt(self) -> str:
+        # STATIC PREFIX — cached by OpenAI after first call
         system = load_prompt("system.md")
+        lhost = f"\nLHOST: {self.lhost}" if self.lhost else ""
+        static = f"{system}\n\nTarget: {self.target}{lhost}"
+
+        # SEMI-STATIC — cached within a phase (changes on phase transition)
         phase_prompt = load_prompt(f"{self.phase}.md")
+        semi_static = f"\n\n## Phase: {self.phase}\n{phase_prompt}"
+
+        # DYNAMIC — changes every iteration (not cached)
+        dynamic_parts = []
+
         state_summary = self.state.get_prompt_summary()
-        graph_summary = self.graph.get_summary()
-        knowledge_hints = self._get_knowledge_hints()
+        if state_summary:
+            dynamic_parts.append(state_summary)
+
+        knowledge = self._get_knowledge_hints()
+        if knowledge:
+            dynamic_parts.append(knowledge)
+
+        # Brief graph count instead of full summary — state already has all actionable info
+        graph_brief = self.graph.get_brief_summary()
+        if graph_brief:
+            dynamic_parts.append(graph_brief)
 
         remaining = max(0, 30 - self._tool_call_count)
-        budget = f"## Tool Budget: {remaining} calls remaining (used {self._tool_call_count}/30)"
-        lhost_section = f"\n\n## Attacker IP (LHOST): {self.lhost}" if self.lhost else ""
+        dynamic_parts.append(f"Budget: {remaining}/30 calls left")
 
-        parts = [
-            system,
-            f"## Current Phase: {self.phase}",
-            phase_prompt,
-            state_summary,
-            f"## Attack Graph\n{graph_summary}",
-            f"## Target: {self.target}{lhost_section}",
-            budget,
-        ]
-        if knowledge_hints:
-            parts.insert(4, knowledge_hints)
-
-        return '\n\n'.join(parts)
+        return static + semi_static + '\n\n' + '\n\n'.join(dynamic_parts)
 
     def _get_knowledge_hints(self) -> str:
         """Match discovered services against exploit knowledge base."""
@@ -251,7 +263,12 @@ class Agent:
         return ""
 
     def _get_tools(self) -> list[dict]:
-        return META_TOOLS + get_tools_for_phase(self.phase)
+        phase_tools = get_tools_for_phase(self.phase)
+        # Circuit breaker: exclude tools that have failed 2+ times consecutively
+        blocked = {name for name, count in self._tool_failures.items() if count >= 2}
+        if blocked:
+            phase_tools = [t for t in phase_tools if t['function']['name'] not in blocked]
+        return META_TOOLS + phase_tools
 
     # ── Main agent loop ──────────────────────────────────────────
 
@@ -330,13 +347,14 @@ class Agent:
                     return
 
                 llm_time = time.time() - llm_start
-                usage = getattr(response, 'usage', None)
-                if usage:
-                    inp = getattr(usage, 'prompt_tokens', 0) or 0
-                    out = getattr(usage, 'completion_tokens', 0) or 0
-                    self.total_input_tokens += inp
-                    self.total_output_tokens += out
-                    L.log(f"{C_DIM}LLM: {llm_time:.1f}s | {inp}/{out} tokens | total: {self.total_input_tokens}/{self.total_output_tokens}{C_RESET}")
+                usage_info = extract_usage(response)
+                self.total_input_tokens += usage_info['input']
+                self.total_output_tokens += usage_info['output']
+                self.total_cached_tokens += usage_info['cached']
+                self.total_cost += usage_info['cost']
+                if usage_info['input']:
+                    cached_pct = f" ({usage_info['cached']} cached)" if usage_info['cached'] else ""
+                    L.log(f"{C_DIM}LLM: {llm_time:.1f}s | {usage_info['input']}{cached_pct}/{usage_info['output']} tokens | ${usage_info['cost']:.4f} (total: ${self.total_cost:.4f}){C_RESET}")
 
                 choice = response.choices[0]
                 message = choice.message
@@ -419,6 +437,14 @@ class Agent:
                     result_lines = result.count('\n') + 1
                     L.log(f"{C_GREEN}Done: {name} | {tool_time:.1f}s | {len(result)} chars, {result_lines} lines{C_RESET}")
 
+                    # Circuit breaker: track consecutive failures per tool
+                    if result.startswith('[ERROR]') or result.startswith('[TIMEOUT'):
+                        self._tool_failures[name] = self._tool_failures.get(name, 0) + 1
+                        if self._tool_failures[name] >= 2:
+                            L.log(f"{C_RED}Circuit breaker: {name} failed {self._tool_failures[name]}x — temporarily disabled{C_RESET}")
+                    else:
+                        self._tool_failures.pop(name, None)  # reset on success
+
                     # ── Auto-update graph ────────────────────────
                     parsed = None
                     if name in TOOL_PARSERS and not result.startswith('[ERROR]') and not result.startswith('[TIMEOUT'):
@@ -471,8 +497,10 @@ class Agent:
         # ── Final summary ────────────────────────────────────────
         L.header(f"\n{C_BOLD}{C_BLUE}{'='*60}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  COMPLETE{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Model: {MODEL}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Iterations: {self.total_iterations} | Tool calls: {self._tool_call_count}{C_RESET}")
-        L.header(f"{C_BOLD}{C_BLUE}  Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Tokens: {self.total_input_tokens} in ({self.total_cached_tokens} cached) / {self.total_output_tokens} out{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Estimated cost: ${self.total_cost:.4f}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Graph: {len(self.graph.nodes)} nodes, {len(self.graph.edges)} edges{C_RESET}")
         if self.state.loot:
             for loot_name, value in self.state.loot.items():

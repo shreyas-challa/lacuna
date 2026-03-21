@@ -55,6 +55,17 @@ class GraphManager:
 
         return '\n'.join(lines)
 
+    def get_brief_summary(self) -> str:
+        """One-line summary for token-optimized prompts.
+        Full detail lives in StateManager — the graph is for visualization."""
+        if not self.nodes:
+            return ""
+        counts: dict[str, int] = {}
+        for n in self.nodes.values():
+            counts[n['type']] = counts.get(n['type'], 0) + 1
+        parts = [f"{v} {k}" for k, v in counts.items()]
+        return f"Graph: {len(self.nodes)} nodes ({', '.join(parts)}), {len(self.edges)} edges"
+
     def update_from_args(self, args: dict):
         for node in args.get('nodes', []):
             node_id = node.get('id') or node.get('name', '')

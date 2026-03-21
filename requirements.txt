@@ -1,5 +1,5 @@
-dedalus_labs
 fastapi
 uvicorn[standard]
 websockets
 python-dotenv
+openai
