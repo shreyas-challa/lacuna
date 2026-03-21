@@ -285,18 +285,43 @@ def _strip_think_tags(text: str | None) -> str | None:
 
 
 def _clean_minimax_messages(messages: list) -> list:
-    """Prepare messages for MiniMax: strip <think> tags from assistant history."""
-    cleaned = []
+    """Prepare messages for MiniMax: strip <think> tags and merge consecutive same-role messages.
+
+    MiniMax (like Anthropic) requires strict message alternation.
+    Consecutive user messages from nudge injections must be merged.
+    """
+    # Pass 1: strip <think> tags from assistant messages
+    stripped = []
     for msg in messages:
         if msg.get('role') == 'assistant' and msg.get('content'):
             content = msg['content']
             if '<think>' in content:
                 cmsg = dict(msg)
                 cmsg['content'] = _strip_think_tags(content) or ''
-                cleaned.append(cmsg)
+                stripped.append(cmsg)
                 continue
-        cleaned.append(msg)
-    return cleaned
+        stripped.append(msg)
+
+    # Pass 2: merge consecutive same-role messages (especially user nudges)
+    merged = []
+    for msg in stripped:
+        if merged and merged[-1].get('role') == msg.get('role'):
+            prev = merged[-1]
+            role = msg['role']
+            # Only merge user messages (consecutive assistant or tool messages should not happen
+            # in well-formed conversation, and merging them would lose tool_calls)
+            if role == 'user':
+                prev_content = prev.get('content', '')
+                curr_content = msg.get('content', '')
+                merged[-1] = dict(prev)
+                merged[-1]['content'] = f"{prev_content}\n\n{curr_content}"
+            else:
+                # Don't merge assistant or tool — just append
+                merged.append(msg)
+        else:
+            merged.append(msg)
+
+    return merged
 
 
 async def _minimax_completion(client, messages: list, tools: list | None):
@@ -333,10 +358,13 @@ async def _minimax_completion(client, messages: list, tools: list | None):
         except Exception as e:
             last_error = e
             error_str = str(e).lower()
-            if any(x in error_str for x in ('auth', '401', '400', 'invalid_api_key')):
+            # Auth errors are fatal
+            if any(x in error_str for x in ('auth', '401', 'invalid_api_key')):
                 raise
             if _is_switchable_error(e):
                 raise
+            # MiniMax 400 "tool call result does not follow" — don't crash, retry
+            # (the _enforce_tool_call_ordering pass should have fixed it, but retry just in case)
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAYS[attempt])
     raise last_error

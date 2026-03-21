@@ -654,7 +654,7 @@ class Agent:
                 f"Try accessing other IDs — especially: {', '.join(f'{host_prefix}{base_path}{i}' for i in sorted(try_ids))}. "
                 f"ID 0 often contains pre-existing data (captures, profiles, records) from other users."
             )
-            self.messages.append({'role': 'user', 'content': nudge})
+            self.messages.append({'role': 'user', 'content': nudge, '_iteration': self._iteration_counter})
             L.log(f"{C_CYAN}IDOR pattern detected: {base_path}{current_id} → suggesting IDs: {id_suggestions}{C_RESET}")
 
     # ── Budget broadcasting ──────────────────────────────────────
@@ -706,7 +706,7 @@ class Agent:
             # ── Planning injection at phase entry ─────────────
             if self.phase not in self._plan_injected_for_phase and self.total_iterations > 0:
                 planning_msg = self._inject_planning_prompt()
-                self.messages.append({'role': 'user', 'content': planning_msg})
+                self.messages.append({'role': 'user', 'content': planning_msg, '_iteration': self._iteration_counter})
                 self._plan_injected_for_phase.add(self.phase)
                 L.log(f"{C_CYAN}Injected planning prompt for {self.phase}{C_RESET}")
 
@@ -748,7 +748,7 @@ class Agent:
                         f"- Do NOT just analyze or summarize — execute a concrete action\n"
                         f"- If truly stuck, call transition_phase to move on"
                     )
-                    self.messages.append({'role': 'user', 'content': nudge})
+                    self.messages.append({'role': 'user', 'content': nudge, '_iteration': self._iteration_counter})
                     self._last_nudge_iteration = self.total_iterations
                     L.log(f"{C_YELLOW}Stagnation nudge (iter {iters_in_phase}, 0 new nodes){C_RESET}")
 
@@ -756,7 +756,7 @@ class Agent:
                 if (self._phase_failure_count >= 2 and
                         self.total_iterations - self._reflection_injected_at > 3):
                     reflection_msg = self._inject_reflection_prompt(self._phase_failure_count)
-                    self.messages.append({'role': 'user', 'content': reflection_msg})
+                    self.messages.append({'role': 'user', 'content': reflection_msg, '_iteration': self._iteration_counter})
                     self._reflection_injected_at = self.total_iterations
                     self._phase_failure_count = 0
                     L.log(f"{C_YELLOW}Injected reflection prompt after {self._phase_failure_count} failures{C_RESET}")
@@ -852,7 +852,7 @@ class Agent:
                                 "5. Look for invite codes, registration forms, or API docs\n"
                                 "Do NOT just analyze — take a concrete action with a tool call."
                             )
-                            self.messages.append({'role': 'user', 'content': nudge})
+                            self.messages.append({'role': 'user', 'content': nudge, '_iteration': self._iteration_counter})
                             L.log(f"{C_YELLOW}Enum stuck nudge — redirecting instead of advancing{C_RESET}")
                             consecutive_stops = 0
                             continue
@@ -940,7 +940,7 @@ class Agent:
                                 "- Call transition_phase if you have exhausted this phase\n"
                                 "Your next call MUST use a dedicated tool, NOT execute_command."
                             )
-                            self.messages.append({'role': 'user', 'content': waste_nudge})
+                            self.messages.append({'role': 'user', 'content': waste_nudge, '_iteration': self._iteration_counter})
                             self._consecutive_waste = 0
                             L.log(f"{C_RED}Waste detector: 5+ consecutive wasted calls — injecting corrective prompt{C_RESET}")
                     else:
@@ -961,7 +961,7 @@ class Agent:
                                     f"- Use curl_request to fetch a different resource from the target\n"
                                     f"- Use ffuf_fuzz to discover new endpoints"
                                 )
-                                self.messages.append({'role': 'user', 'content': repetition_nudge})
+                                self.messages.append({'role': 'user', 'content': repetition_nudge, '_iteration': self._iteration_counter})
                                 L.log(f"{C_RED}Repetition detector: {tf_clean} analyzed {self._file_analysis_count[tf_clean]}x with empty results{C_RESET}")
                                 break
 
@@ -1036,6 +1036,18 @@ class Agent:
                         should_break = True
 
                 if should_break:
+                    # Append placeholder results for any remaining tool calls
+                    # MiniMax requires every tool_call to have a corresponding tool result
+                    processed_ids = {m['tool_call_id'] for m in self.messages
+                                     if m.get('role') == 'tool' and m.get('tool_call_id')}
+                    for remaining_tc in message.tool_calls:
+                        if remaining_tc.id not in processed_ids:
+                            self.messages.append({
+                                'role': 'tool',
+                                'tool_call_id': remaining_tc.id,
+                                'content': '[SKIPPED — phase transition or completion in progress]',
+                                '_iteration': self._iteration_counter,
+                            })
                     break
 
         # ── Final summary ────────────────────────────────────────
