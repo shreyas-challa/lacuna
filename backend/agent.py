@@ -15,7 +15,7 @@ import inspect
 from pathlib import Path
 from datetime import datetime
 
-from backend.llm import get_client, chat_completion, extract_usage, MODEL
+from backend.llm import get_client, chat_completion, extract_usage, get_active_model, get_active_backend
 from backend.graph import GraphManager
 from backend.report import ReportBuilder
 from backend.ws_manager import WSManager
@@ -497,7 +497,7 @@ class Agent:
         # ── Final summary ────────────────────────────────────────
         L.header(f"\n{C_BOLD}{C_BLUE}{'='*60}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  COMPLETE{C_RESET}")
-        L.header(f"{C_BOLD}{C_BLUE}  Model: {MODEL}{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Model: {get_active_model()} ({get_active_backend()}){C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Iterations: {self.total_iterations} | Tool calls: {self._tool_call_count}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Tokens: {self.total_input_tokens} in ({self.total_cached_tokens} cached) / {self.total_output_tokens} out{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Estimated cost: ${self.total_cost:.4f}{C_RESET}")
