@@ -372,7 +372,11 @@ class CodexAuth:
 
 
 async def _codex_completion(messages: list, tools: list | None):
-    """Call Codex endpoint, translating Chat Completions ↔ Responses API."""
+    """Call Codex endpoint with SSE streaming (required by chatgpt.com backend).
+
+    The chatgpt.com/backend-api/codex endpoint requires stream=true.
+    We consume the full SSE stream and assemble the final response.
+    """
     await _codex_auth.ensure_valid_token()
 
     system, input_items = _translate_messages_for_codex(messages)
@@ -382,7 +386,7 @@ async def _codex_completion(messages: list, tools: list | None):
         "instructions": system or "You are a helpful assistant.",
         "input": input_items,
         "store": False,
-        "stream": False,
+        "stream": True,
     }
     if tools:
         body["tools"] = _translate_tools_for_codex(tools)
@@ -393,18 +397,20 @@ async def _codex_completion(messages: list, tools: list | None):
     for attempt in range(MAX_RETRIES):
         try:
             async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
+                async with client.stream(
+                    "POST",
                     f"{CODEX_BASE_URL}/responses",
                     headers=_codex_auth.get_headers(),
                     json=body,
-                )
-                if resp.status_code == 401:
-                    await _codex_auth._refresh()
-                    continue
-                if resp.status_code == 429:
-                    raise Exception("429 rate_limit: Codex rate limit exceeded")
-                resp.raise_for_status()
-                data = resp.json()
+                ) as resp:
+                    if resp.status_code == 401:
+                        await resp.aclose()
+                        await _codex_auth._refresh()
+                        continue
+                    if resp.status_code == 429:
+                        raise Exception("429 rate_limit: Codex rate limit exceeded")
+                    resp.raise_for_status()
+                    data = await _consume_codex_sse(resp)
             return _wrap_codex_response(data)
         except Exception as e:
             last_error = e
@@ -413,6 +419,87 @@ async def _codex_completion(messages: list, tools: list | None):
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAYS[attempt])
     raise last_error
+
+
+async def _consume_codex_sse(resp) -> dict:
+    """Consume SSE stream from Codex and assemble the final response object."""
+    output_items = {}  # index -> item dict
+    usage = {}
+    last_response = {}
+
+    async for line in resp.aiter_lines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload == "[DONE]":
+            break
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        event_type = event.get("type", "")
+
+        # response.completed / response.failed — contains full response
+        if event_type in ("response.completed", "response.done"):
+            response_data = event.get("response", event)
+            if response_data.get("output"):
+                last_response = response_data
+            continue
+
+        # response.failed
+        if event_type == "response.failed":
+            error = event.get("response", {}).get("error", {})
+            raise Exception(f"Codex response failed: {error.get('message', event)}")
+
+        # output_item.added — new item in output
+        if event_type == "output_item.added":
+            idx = event.get("output_index", 0)
+            item = event.get("item", {})
+            output_items[idx] = item
+            continue
+
+        # output_item.done — finalized item
+        if event_type == "output_item.done":
+            idx = event.get("output_index", 0)
+            item = event.get("item", {})
+            output_items[idx] = item
+            continue
+
+        # content_part.done — text content finalized
+        if event_type == "content_part.done":
+            idx = event.get("output_index", 0)
+            part = event.get("part", {})
+            if idx in output_items and part.get("type") == "output_text":
+                item = output_items[idx]
+                if item.get("type") == "message":
+                    content = item.get("content", [])
+                    # Update or add the text part
+                    ci = event.get("content_index", 0)
+                    while len(content) <= ci:
+                        content.append({})
+                    content[ci] = part
+                    item["content"] = content
+            continue
+
+        # function_call arguments delta / done
+        if event_type == "function_call_arguments.done":
+            idx = event.get("output_index", 0)
+            if idx in output_items:
+                output_items[idx]["arguments"] = event.get("arguments", "{}")
+            continue
+
+    # If we got a completed response, use it directly
+    if last_response and last_response.get("output"):
+        return last_response
+
+    # Otherwise assemble from collected items
+    output = [output_items[k] for k in sorted(output_items.keys())]
+    return {
+        "output": output,
+        "usage": last_response.get("usage", usage),
+        "status": last_response.get("status", "completed"),
+    }
 
 
 # ── Codex format translation ────────────────────────────────────
