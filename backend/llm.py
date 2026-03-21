@@ -274,12 +274,47 @@ async def _openai_completion(client, messages: list, tools: list | None):
 
 MINIMAX_BASE_URL = "https://api.minimax.io/v1"
 
+def _strip_think_tags(text: str | None) -> str | None:
+    """Strip MiniMax <think>...</think> reasoning tags from response content."""
+    if not text:
+        return text
+    import re
+    # Remove <think>...</think> blocks (including multiline)
+    stripped = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+    return stripped.strip() or None
+
+
+def _clean_minimax_messages(messages: list) -> list:
+    """Prepare messages for MiniMax: strip <think> tags from assistant history."""
+    cleaned = []
+    for msg in messages:
+        if msg.get('role') == 'assistant' and msg.get('content'):
+            content = msg['content']
+            if '<think>' in content:
+                cmsg = dict(msg)
+                cmsg['content'] = _strip_think_tags(content) or ''
+                cleaned.append(cmsg)
+                continue
+        cleaned.append(msg)
+    return cleaned
+
+
 async def _minimax_completion(client, messages: list, tools: list | None):
-    """MiniMax uses OpenAI-compatible chat completions — same format, different model."""
+    """MiniMax uses OpenAI-compatible chat completions — same format, different model.
+
+    Key differences from OpenAI:
+      - temperature must be in (0.0, 1.0] (not 0-2)
+      - M2.7 returns <think>...</think> tags in content (chain-of-thought)
+      - Full assistant messages (including think tags) should be preserved in history
+    """
+    # Strip <think> tags from prior assistant messages to save tokens
+    clean_msgs = _clean_minimax_messages(messages)
+
     kwargs = {
         'model': MINIMAX_MODEL,
-        'messages': messages,
+        'messages': clean_msgs,
         'max_tokens': 4096,
+        'temperature': 1.0,  # MiniMax requires (0, 1]; recommended: 1.0
     }
     if tools:
         kwargs['tools'] = tools
@@ -288,7 +323,13 @@ async def _minimax_completion(client, messages: list, tools: list | None):
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
-            return await client.chat.completions.create(**kwargs)
+            response = await client.chat.completions.create(**kwargs)
+            # Strip <think> tags from response content
+            if response.choices and response.choices[0].message.content:
+                response.choices[0].message.content = _strip_think_tags(
+                    response.choices[0].message.content
+                )
+            return response
         except Exception as e:
             last_error = e
             error_str = str(e).lower()
