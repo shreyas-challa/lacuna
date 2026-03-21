@@ -113,12 +113,38 @@ async def download_and_analyze(url: str, filename: str) -> str:
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
 
     if ext == 'pcap' or ext == 'pcapng':
-        # Analyze with tshark - show all packets with full protocol decode
-        analysis = await run_command(f'tshark -r {filepath} -V 2>/dev/null || tcpdump -r {filepath} -A 2>/dev/null', timeout=60)
-        if not analysis.strip() or analysis.startswith('[ERROR]'):
-            # Fallback to strings
-            analysis = await run_command(f'strings {filepath}', timeout=30)
-        return f"Downloaded {filename} (HTTP {dl_result.strip()})\n\n=== PCAP Analysis ===\n{analysis}"
+        # Targeted credential extraction — tshark -V is far too verbose and hits the output cap
+        ftp_creds = await run_command(
+            f'tshark -r {filepath} -Y "ftp" -T fields -e ftp.request.command -e ftp.request.arg 2>/dev/null',
+            timeout=30,
+        )
+        http_auth = await run_command(
+            f'tshark -r {filepath} -Y "http.authorization or http.request.uri" -T fields '
+            f'-e http.request.method -e http.request.uri -e http.authorization 2>/dev/null',
+            timeout=30,
+        )
+        tcp_stream = await run_command(
+            f'tshark -r {filepath} -q -z follow,tcp,ascii,0 2>/dev/null | head -n 150',
+            timeout=30,
+        )
+        cred_strings = await run_command(
+            f'strings {filepath} | grep -iE "(USER|PASS|password|login|auth|username|secret)" | head -n 60',
+            timeout=15,
+        )
+        parts = [f"Downloaded {filename} (HTTP {dl_result.strip()})"]
+        if ftp_creds.strip():
+            parts.append(f"=== FTP Commands ===\n{ftp_creds}")
+        if http_auth.strip():
+            parts.append(f"=== HTTP Auth/Requests ===\n{http_auth}")
+        if tcp_stream.strip():
+            parts.append(f"=== TCP Stream 0 ===\n{tcp_stream}")
+        if cred_strings.strip():
+            parts.append(f"=== Credential Strings ===\n{cred_strings}")
+        if len(parts) == 1:
+            # Nothing found via targeted queries — fall back to strings
+            fallback = await run_command(f'strings {filepath} | head -n 200', timeout=30)
+            parts.append(f"=== Strings (fallback) ===\n{fallback}")
+        return '\n\n'.join(parts)
     elif ext in ('txt', 'conf', 'cfg', 'xml', 'json', 'html', 'php', 'py', 'sh', 'log'):
         content = await run_command(f'cat {filepath}', timeout=10)
         return f"Downloaded {filename} (HTTP {dl_result.strip()})\n\n=== File Contents ===\n{content}"

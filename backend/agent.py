@@ -156,13 +156,21 @@ def parse_command_output_for_graph(output: str, target: str) -> dict:
         edges.append({'source': 'root-access', 'target': 'root-flag', 'label': 'flag'})
 
     # Detect credentials in output (FTP USER/PASS from pcap strings)
+    ftp_users = []
     for m in re.finditer(r'USER\s+(\S+)', output):
         user = m.group(1)
         if user and user not in ('anonymous', 'ftp'):
+            ftp_users.append(user)
             nodes.append({'id': f'user-{user}', 'label': f'User: {user}', 'type': 'user'})
             edges.append({'source': target, 'target': f'user-{user}', 'label': 'cred found'})
-    for m in re.finditer(r'PASS\s+(\S+)', output):
-        nodes.append({'id': 'cred-found', 'label': 'Credentials Found', 'type': 'vulnerability'})
+    for i, m in enumerate(re.finditer(r'PASS\s+(\S+)', output)):
+        passwd = m.group(1)
+        node_id = f'cred-{passwd[:30]}'
+        nodes.append({'id': node_id, 'label': f'Password: {passwd}', 'type': 'vulnerability'})
+        if i < len(ftp_users):
+            edges.append({'source': f'user-{ftp_users[i]}', 'target': node_id, 'label': 'password'})
+        else:
+            edges.append({'source': target, 'target': node_id, 'label': 'credential'})
 
     # Detect cap_setuid or capability escalation
     if 'cap_setuid' in output:
@@ -220,13 +228,16 @@ class Agent:
         self._tool_call_count = 0  # total tool calls made (for budget tracking)
         self._phase_entry_iteration = 0  # iteration when current phase started
         self._phase_entry_node_count = 0  # graph node count when current phase started
+        self._last_nudge_iteration = -99  # cooldown tracker for stagnation nudges
 
     def _build_system_prompt(self) -> str:
         system = load_prompt("system.md")
         phase_prompt = load_prompt(f"{self.phase}.md")
         graph_summary = self.graph.get_summary()
         lhost_section = f"\n\n## Attacker IP (LHOST): {self.lhost}" if self.lhost else ""
-        return f"{system}\n\n## Current Phase: {self.phase}\n\n{phase_prompt}\n\n## Current Graph State\n{graph_summary}\n\n## Target: {self.target}{lhost_section}"
+        remaining_budget = max(0, 30 - self._tool_call_count)
+        budget_note = f"\n\n## Tool Budget: {remaining_budget} calls remaining (used {self._tool_call_count}/30)"
+        return f"{system}\n\n## Current Phase: {self.phase}\n\n{phase_prompt}\n\n## Current Graph State\n{graph_summary}\n\n## Target: {self.target}{lhost_section}{budget_note}"
 
     def _get_tools(self) -> list[dict]:
         phase_tools = get_tools_for_phase(self.phase)
@@ -267,10 +278,12 @@ class Agent:
                 self.total_iterations += 1
                 phase_iterations += 1
 
-                # Phase stagnation nudge: if 8+ iterations in same phase with no new graph nodes
+                # Phase stagnation nudge: if 8+ iterations in same phase with no new graph nodes,
+                # inject once per 5 iterations (cooldown prevents spam)
                 iters_in_phase = self.total_iterations - self._phase_entry_iteration
                 new_nodes = len(self.graph.nodes) - self._phase_entry_node_count
-                if iters_in_phase > 8 and new_nodes == 0:
+                iterations_since_nudge = self.total_iterations - self._last_nudge_iteration
+                if iters_in_phase > 8 and new_nodes == 0 and iterations_since_nudge >= 5:
                     nudge = (
                         f"[SYSTEM] You have been in the '{self.phase}' phase for {iters_in_phase} iterations "
                         f"without discovering new information (no new graph nodes). Either transition to the next "
@@ -278,6 +291,7 @@ class Agent:
                         f"and why previous attempts failed."
                     )
                     self.messages.append({'role': 'user', 'content': nudge})
+                    self._last_nudge_iteration = self.total_iterations
                     L.log(f"{C_YELLOW}Phase stagnation nudge injected (iter {iters_in_phase}, 0 new nodes){C_RESET}")
 
                 L.log(f"{C_DIM}--- Iteration {self.total_iterations}/{MAX_TOTAL_ITERATIONS} (phase: {phase_iterations}/{MAX_ITERATIONS_PER_PHASE}) ---{C_RESET}")
@@ -338,7 +352,7 @@ class Agent:
 
                     # CRITICAL: if model stops without tool calls, it's done with this phase
                     # Don't keep looping — either advance phase or complete
-                    if consecutive_stops >= 1:
+                    if consecutive_stops >= 2:
                         current_idx = PHASES.index(self.phase) if self.phase in PHASES else len(PHASES) - 1
                         if current_idx < len(PHASES) - 1:
                             self.phase = PHASES[current_idx + 1]
@@ -388,8 +402,13 @@ class Agent:
                         tool_start = time.time()
                         result = await self._execute_tool(name, args)
                         tool_time = time.time() - tool_start
-                        # Cache the result (skip meta-tools and errors that might be transient)
-                        if name not in ('transition_phase', 'append_report', 'update_graph'):
+                        # Cache only idempotent read-only tools; never cache stateful/exploitation tools
+                        _NO_CACHE = {
+                            'transition_phase', 'append_report', 'update_graph',
+                            'msfconsole_run', 'send_payload', 'setup_listener',
+                            'run_linpeas', 'check_sudo', 'check_suid', 'check_cron',
+                        }
+                        if name not in _NO_CACHE:
                             self._tool_cache[cache_key] = result
 
                     result_lines = result.count('\n') + 1

@@ -5,108 +5,118 @@ import re
 
 def parse_nmap(output: str, target: str) -> dict:
     """Parse nmap output for open ports and services."""
-    nodes = []
-    edges = []
-
-    # Match lines like: 22/tcp   open  ssh     OpenSSH 8.2p1
-    for m in re.finditer(r'(\d+)/(tcp|udp)\s+open\s+(\S+)\s*(.*)', output):
-        port, proto, service, version = m.groups()
-        version = version.strip()
-        node_id = f'{target}:{port}'
-        label = f'{service}/{port}' + (f' ({version})' if version else '')
-        nodes.append({'id': node_id, 'label': label, 'type': 'service'})
-        edges.append({'source': target, 'target': node_id, 'label': proto})
-
-    return {'nodes': nodes, 'edges': edges}
+    try:
+        nodes = []
+        edges = []
+        for m in re.finditer(r'(\d+)/(tcp|udp)\s+open\s+(\S+)\s*(.*)', output):
+            port, proto, service, version = m.groups()
+            version = version.strip()
+            node_id = f'{target}:{port}'
+            label = f'{service}/{port}' + (f' ({version})' if version else '')
+            nodes.append({'id': node_id, 'label': label, 'type': 'service'})
+            edges.append({'source': target, 'target': node_id, 'label': proto})
+        return {'nodes': nodes, 'edges': edges}
+    except Exception:
+        return {'nodes': [], 'edges': []}
 
 
 def parse_gobuster(output: str, target: str) -> dict:
     """Parse gobuster output for discovered directories."""
-    nodes = []
-    edges = []
-
-    # Match lines like: /admin                (Status: 200) [Size: 1234]
-    for m in re.finditer(r'(/\S+)\s+\(Status:\s*(\d+)\)', output):
-        path, status = m.groups()
-        node_id = f'{target}{path}'
-        nodes.append({'id': node_id, 'label': f'{path} [{status}]', 'type': 'service'})
-        # Find the web service node to connect to, or fallback to target
-        edges.append({'source': target, 'target': node_id, 'label': 'path'})
-
-    return {'nodes': nodes, 'edges': edges}
+    try:
+        nodes = []
+        edges = []
+        for m in re.finditer(r'(/\S+)\s+\(Status:\s*(\d+)\)', output):
+            path, status = m.groups()
+            node_id = f'{target}{path}'
+            nodes.append({'id': node_id, 'label': f'{path} [{status}]', 'type': 'service'})
+            edges.append({'source': target, 'target': node_id, 'label': 'path'})
+        return {'nodes': nodes, 'edges': edges}
+    except Exception:
+        return {'nodes': [], 'edges': []}
 
 
 def parse_ffuf(output: str, target: str) -> dict:
     """Parse ffuf output for discovered endpoints."""
-    nodes = []
-    edges = []
-
-    # ffuf output: path  [Status: 200, Size: 1234, ...]
-    for m in re.finditer(r'(\S+)\s+\[Status:\s*(\d+)', output):
-        path, status = m.groups()
-        node_id = f'{target}/{path}'
-        nodes.append({'id': node_id, 'label': f'/{path} [{status}]', 'type': 'service'})
-        edges.append({'source': target, 'target': node_id, 'label': 'path'})
-
-    return {'nodes': nodes, 'edges': edges}
+    try:
+        nodes = []
+        edges = []
+        for m in re.finditer(r'(\S+)\s+\[Status:\s*(\d+)', output):
+            path, status = m.groups()
+            node_id = f'{target}/{path}'
+            nodes.append({'id': node_id, 'label': f'/{path} [{status}]', 'type': 'service'})
+            edges.append({'source': target, 'target': node_id, 'label': 'path'})
+        return {'nodes': nodes, 'edges': edges}
+    except Exception:
+        return {'nodes': [], 'edges': []}
 
 
 def parse_nuclei(output: str, target: str) -> dict:
     """Parse nuclei output for vulnerabilities."""
-    nodes = []
-    edges = []
-
-    # nuclei output: [vuln-id] [severity] [proto] url info
-    for m in re.finditer(r'\[([^\]]+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+(\S+)', output):
-        vuln_id, severity, proto, url = m.groups()
-        node_id = f'vuln-{vuln_id}'
-        nodes.append({'id': node_id, 'label': f'{vuln_id} ({severity})', 'type': 'vulnerability'})
-        edges.append({'source': target, 'target': node_id, 'label': severity})
-
-    return {'nodes': nodes, 'edges': edges}
+    try:
+        nodes = []
+        edges = []
+        for m in re.finditer(r'\[([^\]]+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+(\S+)', output):
+            vuln_id, severity, proto, url = m.groups()
+            node_id = f'vuln-{vuln_id}'
+            nodes.append({'id': node_id, 'label': f'{vuln_id} ({severity})', 'type': 'vulnerability'})
+            edges.append({'source': target, 'target': node_id, 'label': severity})
+        return {'nodes': nodes, 'edges': edges}
+    except Exception:
+        return {'nodes': [], 'edges': []}
 
 
 def parse_searchsploit(output: str, target: str) -> dict:
     """Parse searchsploit for found exploits."""
-    nodes = []
-    edges = []
-
-    # searchsploit table rows with exploit titles and paths
-    for m in re.finditer(r'(\S.*\S)\s+\|\s+(exploits/\S+|shellcodes/\S+)', output):
-        title, path = m.groups()
-        title = title.strip()[:60]
-        node_id = f'exploit-{path.replace("/", "-")}'
-        nodes.append({'id': node_id, 'label': title, 'type': 'vulnerability'})
-        edges.append({'source': target, 'target': node_id, 'label': 'exploit'})
-
-    return {'nodes': nodes, 'edges': edges}
+    try:
+        nodes = []
+        edges = []
+        for m in re.finditer(r'(\S.*\S)\s+\|\s+(exploits/\S+|shellcodes/\S+)', output):
+            title, path = m.groups()
+            title = title.strip()[:60]
+            node_id = f'exploit-{path.replace("/", "-")}'
+            nodes.append({'id': node_id, 'label': title, 'type': 'vulnerability'})
+            edges.append({'source': target, 'target': node_id, 'label': 'exploit'})
+        return {'nodes': nodes, 'edges': edges}
+    except Exception:
+        return {'nodes': [], 'edges': []}
 
 
 def parse_pcap_analysis(output: str, target: str) -> dict:
     """Parse pcap/tshark output for credentials and interesting data."""
-    nodes = []
-    edges = []
+    try:
+        nodes = []
+        edges = []
 
-    # Look for FTP credentials (USER/PASS commands)
-    for m in re.finditer(r'(?:USER|user)\s+(\S+)', output):
-        user = m.group(1)
-        if user and user not in ('anonymous', ''):
+        # Extract FTP USER/PASS in order so we can pair them
+        ftp_users = [m.group(1) for m in re.finditer(r'(?:^|\s)USER\s+(\S+)', output, re.MULTILINE)
+                     if m.group(1).lower() not in ('anonymous', 'ftp', '')]
+        ftp_passes = [m.group(1) for m in re.finditer(r'(?:^|\s)PASS\s+(\S+)', output, re.MULTILINE)
+                      if m.group(1) != '']
+
+        for user in ftp_users:
             node_id = f'user-{user}'
             nodes.append({'id': node_id, 'label': f'User: {user}', 'type': 'user'})
             edges.append({'source': target, 'target': node_id, 'label': 'cred found'})
-    for m in re.finditer(r'(?:PASS|pass)\s+(\S+)', output):
-        passwd = m.group(1)
-        if passwd:
-            node_id = f'cred-{passwd[:20]}'
-            nodes.append({'id': node_id, 'label': f'Password found', 'type': 'vulnerability'})
 
-    # Look for HTTP auth / Basic auth
-    for m in re.finditer(r'Authorization:\s*Basic\s+(\S+)', output):
-        node_id = 'vuln-basic-auth'
-        nodes.append({'id': node_id, 'label': 'Basic Auth Creds', 'type': 'vulnerability'})
-        edges.append({'source': target, 'target': node_id, 'label': 'credential'})
+        for i, passwd in enumerate(ftp_passes):
+            node_id = f'cred-{passwd[:30]}'
+            # Store the ACTUAL password in the label so it's visible in graph summary
+            nodes.append({'id': node_id, 'label': f'Password: {passwd}', 'type': 'vulnerability'})
+            # Link to the corresponding user if we can pair them
+            if i < len(ftp_users):
+                edges.append({'source': f'user-{ftp_users[i]}', 'target': node_id, 'label': 'password'})
+            else:
+                edges.append({'source': target, 'target': node_id, 'label': 'credential'})
 
-    return {'nodes': nodes, 'edges': edges}
+        # HTTP Basic Auth
+        for m in re.finditer(r'Authorization:\s*Basic\s+(\S+)', output):
+            node_id = 'vuln-basic-auth'
+            nodes.append({'id': node_id, 'label': 'Basic Auth Creds', 'type': 'vulnerability'})
+            edges.append({'source': target, 'target': node_id, 'label': 'credential'})
+
+        return {'nodes': nodes, 'edges': edges}
+    except Exception:
+        return {'nodes': [], 'edges': []}
 
 
 # Map tool names to their parsers
