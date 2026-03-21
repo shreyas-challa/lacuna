@@ -33,11 +33,19 @@ def parse_nmap(output: str, target: str) -> dict:
 def parse_gobuster(output: str, target: str) -> dict:
     try:
         nodes, edges = [], []
+        # Standard format: /path  (Status: 200) [Size: 1234]
         for m in re.finditer(r'(/\S+)\s+\(Status:\s*(\d+)\)', output):
             path, status = m.groups()
+            if status == '404':
+                continue
             node_id = f'{target}{path}'
-            nodes.append({'id': node_id, 'label': f'{path} [{status}]', 'type': 'service'})
-            edges.append({'source': target, 'target': node_id, 'label': 'path'})
+            if not any(n['id'] == node_id for n in nodes):
+                nodes.append({'id': node_id, 'label': f'{path} [{status}]', 'type': 'service'})
+                edges.append({'source': target, 'target': node_id, 'label': 'path'})
+        # Cap at 15 nodes
+        if len(nodes) > 15:
+            nodes = nodes[:15]
+            edges = edges[:15]
         return {'nodes': nodes, 'edges': edges}
     except Exception:
         return {'nodes': [], 'edges': []}
@@ -46,11 +54,25 @@ def parse_gobuster(output: str, target: str) -> dict:
 def parse_ffuf(output: str, target: str) -> dict:
     try:
         nodes, edges = [], []
-        for m in re.finditer(r'(\S+)\s+\[Status:\s*(\d+)', output):
-            path, status = m.groups()
+        # Only parse actual ffuf result lines: "path  [Status: NNN, Size: NNN, ...]"
+        for m in re.finditer(r'^(\S+)\s+\[Status:\s*(\d+),\s*Size:\s*(\d+)', output, re.MULTILINE):
+            path, status, size = m.groups()
+            # Skip noise: ffuf banner lines, stats, or very short generic paths
+            if path.startswith('[') or path.startswith('::') or len(path) < 1:
+                continue
+            # Only add interesting status codes (not 404s or generic redirects)
+            if status in ('404',):
+                continue
             node_id = f'{target}/{path}'
+            # Deduplicate
+            if any(n['id'] == node_id for n in nodes):
+                continue
             nodes.append({'id': node_id, 'label': f'/{path} [{status}]', 'type': 'service'})
             edges.append({'source': target, 'target': node_id, 'label': 'path'})
+        # Cap at 15 nodes to prevent graph flooding
+        if len(nodes) > 15:
+            nodes = nodes[:15]
+            edges = edges[:15]
         return {'nodes': nodes, 'edges': edges}
     except Exception:
         return {'nodes': [], 'edges': []}

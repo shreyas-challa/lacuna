@@ -34,8 +34,8 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
 PHASES = ['enumeration', 'exploitation', 'privesc']
-MAX_ITERATIONS_PER_PHASE = 15
-MAX_TOTAL_ITERATIONS = 60
+MAX_ITERATIONS_PER_PHASE = 40
+MAX_TOTAL_ITERATIONS = 150
 
 # ── Terminal colors ──────────────────────────────────────────────
 C_RESET = '\033[0m'
@@ -273,6 +273,8 @@ class Agent:
         self._terminal = _find_terminal()
         # Track previous access count for detecting new access
         self._prev_access_count: int = 0
+        # Track hostnames added to /etc/hosts
+        self._hosts_added: set = set()
 
     # ── System prompt construction ───────────────────────────────
     def _build_system_prompt(self) -> str:
@@ -305,8 +307,9 @@ class Agent:
         if graph_brief:
             dynamic_parts.append(graph_brief)
 
-        remaining = max(0, 30 - self._tool_call_count)
-        dynamic_parts.append(f"Budget: {remaining}/30 calls left")
+        budget_total = MAX_TOTAL_ITERATIONS
+        remaining = max(0, budget_total - self._tool_call_count)
+        dynamic_parts.append(f"Budget: {remaining}/{budget_total} calls left")
 
         return static + semi_static + '\n\n' + '\n\n'.join(dynamic_parts)
 
@@ -530,13 +533,55 @@ class Agent:
 
         self._prev_access_count = current_count
 
+    # ── Auto /etc/hosts management ─────────────────────────────
+
+    async def _auto_add_hosts(self, output: str):
+        """Detect hostnames in tool output and add them to /etc/hosts."""
+        L = self.logger
+        # Match patterns like "redirect to http://hostname.tld" or "Did not follow redirect to http://hostname.htb"
+        hostnames = set()
+        for m in re.finditer(r'https?://([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,})', output):
+            hostname = m.group(1).lower()
+            # Skip common non-target hostnames
+            if any(hostname.endswith(skip) for skip in ('.com', '.org', '.net', '.io', '.dev', '.gov')):
+                continue
+            hostnames.add(hostname)
+
+        for hostname in hostnames:
+            if hostname in self._hosts_added:
+                continue
+            # Check if already in /etc/hosts
+            try:
+                with open('/etc/hosts', 'r') as f:
+                    hosts_content = f.read()
+                if hostname in hosts_content:
+                    self._hosts_added.add(hostname)
+                    continue
+            except Exception:
+                continue
+
+            # Add to /etc/hosts
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    f'echo "{self.target} {hostname}" | sudo tee -a /etc/hosts',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+                if proc.returncode == 0:
+                    self._hosts_added.add(hostname)
+                    L.log(f"{C_CYAN}Auto-added to /etc/hosts: {self.target} {hostname}{C_RESET}")
+            except Exception:
+                pass
+
     # ── Budget broadcasting ──────────────────────────────────────
 
     async def _broadcast_budget(self):
-        remaining = max(0, 30 - self._tool_call_count)
+        budget_total = MAX_TOTAL_ITERATIONS
+        remaining = max(0, budget_total - self._tool_call_count)
         await self.manager.broadcast('budget_update', {
             'remaining': remaining,
-            'total': 30,
+            'total': budget_total,
             'used': self._tool_call_count,
         })
 
@@ -591,11 +636,24 @@ class Agent:
                 iters_in_phase = self.total_iterations - self._phase_entry_iteration
                 new_nodes = len(self.graph.nodes) - self._phase_entry_node_count
                 iterations_since_nudge = self.total_iterations - self._last_nudge_iteration
+
+                # Hard stagnation: in exploitation/privesc without access for too long → complete
+                if iters_in_phase > 15 and self.phase in ('exploitation', 'privesc'):
+                    has_access = bool(self.state.accesses)
+                    has_creds = bool(self.state.credentials)
+                    if not has_access and not has_creds:
+                        L.log(f"{C_RED}Hard stagnation: {self.phase} for {iters_in_phase} iters without access/creds — completing{C_RESET}")
+                        self.phase = 'complete'
+                        self._done = True
+                        break
+
                 if iters_in_phase > 8 and new_nodes == 0 and iterations_since_nudge >= 5:
                     nudge = (
                         f"[SYSTEM] You have been in the '{self.phase}' phase for {iters_in_phase} iterations "
-                        f"without discovering new information. Either transition to the next phase with "
-                        f"transition_phase, or explain what specific information you are still looking for."
+                        f"without discovering new information. You MUST take action NOW:\n"
+                        f"- Call a tool with a DIFFERENT approach than previous attempts\n"
+                        f"- Do NOT just analyze or summarize — execute a concrete action\n"
+                        f"- If truly stuck, call transition_phase to move on"
                     )
                     self.messages.append({'role': 'user', 'content': nudge})
                     self._last_nudge_iteration = self.total_iterations
@@ -684,6 +742,28 @@ class Agent:
 
                     if consecutive_stops >= 2:
                         current_idx = PHASES.index(self.phase) if self.phase in PHASES else len(PHASES) - 1
+                        # Don't auto-advance to exploitation/privesc without actionable intel
+                        has_creds = bool(self.state.credentials)
+                        has_access = bool(self.state.accesses)
+                        has_vulns = bool(self.state.findings)
+
+                        if current_idx == 0 and not has_creds and not has_access and not has_vulns:
+                            # Still in enumeration with nothing — inject a nudge instead of advancing
+                            nudge = (
+                                "[SYSTEM] You are stuck in enumeration without findings. "
+                                "Focus on actionable steps:\n"
+                                "1. Add discovered hostnames to /etc/hosts if needed\n"
+                                "2. Try registering an account on any web app\n"
+                                "3. Try API endpoint fuzzing with ffuf_fuzz\n"
+                                "4. Try default credentials with hydra_brute\n"
+                                "5. Look for invite codes, registration forms, or API docs\n"
+                                "Do NOT just analyze — take a concrete action with a tool call."
+                            )
+                            self.messages.append({'role': 'user', 'content': nudge})
+                            L.log(f"{C_YELLOW}Enum stuck nudge — redirecting instead of advancing{C_RESET}")
+                            consecutive_stops = 0
+                            continue
+
                         if current_idx < len(PHASES) - 1:
                             self.phase = PHASES[current_idx + 1]
                             self._phase_entry_iteration = self.total_iterations
@@ -760,6 +840,10 @@ class Agent:
                     # ── Feed state extractors ────────────────────
                     if name in STATE_EXTRACTORS and not result.startswith('[ERROR]'):
                         STATE_EXTRACTORS[name](result, self.target, self.state)
+
+                    # ── Auto-detect and add hostnames to /etc/hosts ──
+                    if name in ('nmap_scan', 'curl_request', 'execute_command') and not result.startswith('[ERROR]'):
+                        await self._auto_add_hosts(result)
 
                     # ── Check for new shell access ───────────────
                     await self._check_new_access()
