@@ -21,7 +21,7 @@ load_dotenv()
 
 # ── Configuration ────────────────────────────────────────────────
 OPENAI_MODEL = os.getenv("LACUNA_MODEL", "gpt-4.1-mini")
-CODEX_MODEL = os.getenv("LACUNA_CODEX_MODEL", "") or OPENAI_MODEL
+CODEX_MODEL = os.getenv("LACUNA_CODEX_MODEL", "") or "gpt-5.1-codex-mini"
 ANTHROPIC_MODEL = os.getenv("LACUNA_ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 FALLBACK_ENABLED = os.getenv("LACUNA_FALLBACK", "true").lower() in ("true", "1", "yes")
 

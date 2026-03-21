@@ -9,27 +9,38 @@
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
-  <header>
+  <!-- Status bar -->
+  <header id="status-bar">
     <div class="logo">LACUNA</div>
-    <div class="controls">
-      <input type="text" id="target-input" placeholder="Target IP (e.g. 10.10.10.1)">
-      <input type="text" id="lhost-input" placeholder="Your IP (e.g. 10.10.14.5)">
-      <button id="start-btn">START</button>
+    <div id="phase-stepper">
+      <div class="phase-dot active" data-phase="recon"><span class="phase-label-text">RECON</span></div>
+      <div class="phase-connector"></div>
+      <div class="phase-dot" data-phase="exploit"><span class="phase-label-text">EXPLOIT</span></div>
+      <div class="phase-connector"></div>
+      <div class="phase-dot" data-phase="escalate"><span class="phase-label-text">PRIVESC</span></div>
     </div>
-    <div class="phase-indicator">
-      <span id="phase-label">IDLE</span>
-    </div>
+    <div id="status-text">IDLE</div>
   </header>
 
+  <!-- Main content -->
   <main>
     <div id="graph-container">
       <svg id="graph-svg"></svg>
+      <div id="graph-legend">
+        <div class="legend-item"><span class="legend-swatch" style="background:#e8a634"></span>Machine</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:#22c55e"></span>Service</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:#eab308"></span>User</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:#f97316"></span>Vuln</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:#ef4444"></span>Root</div>
+      </div>
     </div>
 
     <div id="panel">
       <div class="panel-tabs">
-        <button class="tab active" data-tab="tools">Tools</button>
+        <button class="tab active" data-tab="tools">Activity</button>
         <button class="tab" data-tab="report">Report</button>
+        <button class="tab" data-tab="intel">Intel</button>
+        <button class="tab" data-tab="sessions">Sessions</button>
       </div>
       <div id="tools-panel" class="panel-content active">
         <div id="tool-log"></div>
@@ -37,12 +48,45 @@
       <div id="report-panel" class="panel-content">
         <div id="report-content"></div>
       </div>
+      <div id="intel-panel" class="panel-content">
+        <div id="strategy-section"></div>
+        <div id="intel-content"></div>
+      </div>
+      <div id="sessions-panel" class="panel-content">
+        <div id="sessions-empty" class="sessions-empty">No active sessions. Shells will appear here when the agent gains access.</div>
+        <div id="sessions-list"></div>
+      </div>
     </div>
   </main>
+
+  <!-- Command bar -->
+  <footer id="command-bar">
+    <div id="input-section">
+      <div class="input-group">
+        <label for="target-input">TARGET</label>
+        <input type="text" id="target-input" placeholder="10.10.10.1" spellcheck="false">
+        <span id="target-validation" class="validation-icon"></span>
+      </div>
+      <div class="input-group">
+        <label for="lhost-input">LHOST</label>
+        <input type="text" id="lhost-input" placeholder="10.10.14.5" spellcheck="false">
+        <span id="lhost-validation" class="validation-icon"></span>
+      </div>
+      <button id="engage-btn">ENGAGE</button>
+    </div>
+    <div id="metrics-section" class="hidden">
+      <div class="metric"><span class="metric-label">TIME</span><span id="metric-time" class="metric-value">00:00</span></div>
+      <div class="metric"><span class="metric-label">TOOLS</span><span id="metric-tools" class="metric-value">0</span></div>
+      <div class="metric"><span class="metric-label">NODES</span><span id="metric-nodes" class="metric-value">0</span></div>
+      <div class="metric budget-metric"><span class="metric-label">BUDGET</span><span id="metric-budget" class="metric-value budget-value">30/30</span></div>
+      <div class="metric"><span class="metric-label">TARGET</span><span id="metric-target" class="metric-value">—</span></div>
+    </div>
+  </footer>
 
   <script src="/static/graph.js"></script>
   <script src="/static/toolpanel.js"></script>
   <script src="/static/report.js"></script>
+  <script src="/static/intel.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

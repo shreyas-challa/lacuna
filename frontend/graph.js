@@ -1,20 +1,30 @@
-// D3.js force-directed attack graph
+// D3.js force-directed attack graph — Phosphor theme
 
 const GraphViz = (() => {
   const NODE_COLORS = {
-    machine: '#3b82f6',
+    machine: '#e8a634',
     service: '#22c55e',
     user: '#eab308',
     vulnerability: '#f97316',
     root: '#ef4444',
   };
 
-  const NODE_RADIUS = 18;
+  const NODE_ICONS = {
+    machine: 'M',
+    service: 'S',
+    user: 'U',
+    vulnerability: 'V',
+    root: 'R',
+  };
 
-  let svg, container, simulation;
+  const NODE_RADIUS = 16;
+  const GLOW_RADIUS = 22;
+
+  let svg, defs, container, simulation;
   let nodeGroup, linkGroup, labelGroup, linkLabelGroup;
   let currentNodes = [];
   let currentLinks = [];
+  let nodeCount = 0;
 
   function init() {
     svg = d3.select('#graph-svg');
@@ -22,29 +32,76 @@ const GraphViz = (() => {
     const width = rect.width;
     const height = rect.height;
 
-    // Zoom behavior
-    const zoom = d3.zoom()
-      .scaleExtent([0.2, 4])
-      .on('zoom', (event) => {
-        container.attr('transform', event.transform);
-      });
+    defs = svg.append('defs');
 
-    svg.call(zoom);
+    // Dot grid pattern
+    const pattern = defs.append('pattern')
+      .attr('id', 'dot-grid')
+      .attr('width', 20)
+      .attr('height', 20)
+      .attr('patternUnits', 'userSpaceOnUse');
+    pattern.append('circle')
+      .attr('cx', 10)
+      .attr('cy', 10)
+      .attr('r', 0.8)
+      .attr('fill', '#1a1a1a');
 
-    container = svg.append('g');
+    // Background rect with dot grid
+    svg.insert('rect', ':first-child')
+      .attr('width', '100%')
+      .attr('height', '100%')
+      .attr('fill', '#0c0c0c');
+    svg.insert('rect', 'g')
+      .attr('width', '100%')
+      .attr('height', '100%')
+      .attr('fill', 'url(#dot-grid)');
 
     // Arrow marker
-    svg.append('defs').append('marker')
+    defs.append('marker')
       .attr('id', 'arrow')
-      .attr('viewBox', '0 -5 10 10')
-      .attr('refX', NODE_RADIUS + 10)
+      .attr('viewBox', '0 -4 8 8')
+      .attr('refX', GLOW_RADIUS + 8)
       .attr('refY', 0)
       .attr('markerWidth', 6)
       .attr('markerHeight', 6)
       .attr('orient', 'auto')
       .append('path')
-      .attr('d', 'M0,-5L10,0L0,5')
-      .attr('fill', '#2a3550');
+      .attr('d', 'M0,-4L8,0L0,4')
+      .attr('fill', '#2a2a2a');
+
+    // Glow filters per type
+    Object.entries(NODE_COLORS).forEach(([type, color]) => {
+      const filter = defs.append('filter')
+        .attr('id', `glow-${type}`)
+        .attr('x', '-50%').attr('y', '-50%')
+        .attr('width', '200%').attr('height', '200%');
+      filter.append('feGaussianBlur')
+        .attr('in', 'SourceGraphic')
+        .attr('stdDeviation', '3')
+        .attr('result', 'blur');
+      filter.append('feFlood')
+        .attr('flood-color', color)
+        .attr('flood-opacity', '0.4')
+        .attr('result', 'color');
+      filter.append('feComposite')
+        .attr('in', 'color')
+        .attr('in2', 'blur')
+        .attr('operator', 'in')
+        .attr('result', 'glow');
+      const merge = filter.append('feMerge');
+      merge.append('feMergeNode').attr('in', 'glow');
+      merge.append('feMergeNode').attr('in', 'SourceGraphic');
+    });
+
+    // Zoom
+    const zoom = d3.zoom()
+      .scaleExtent([0.2, 4])
+      .on('zoom', (event) => {
+        container.attr('transform', event.transform);
+      });
+    svg.call(zoom);
+
+    container = svg.append('g');
 
     linkGroup = container.append('g').attr('class', 'links');
     linkLabelGroup = container.append('g').attr('class', 'link-labels');
@@ -52,10 +109,10 @@ const GraphViz = (() => {
     labelGroup = container.append('g').attr('class', 'labels');
 
     simulation = d3.forceSimulation()
-      .force('link', d3.forceLink().id(d => d.id).distance(120))
-      .force('charge', d3.forceManyBody().strength(-400))
+      .force('link', d3.forceLink().id(d => d.id).distance(130))
+      .force('charge', d3.forceManyBody().strength(-450))
       .force('center', d3.forceCenter(width / 2, height / 2))
-      .force('collision', d3.forceCollide().radius(NODE_RADIUS + 10))
+      .force('collision', d3.forceCollide().radius(GLOW_RADIUS + 8))
       .on('tick', ticked);
 
     simulation.stop();
@@ -72,13 +129,12 @@ const GraphViz = (() => {
       .attr('x', d => (d.source.x + d.target.x) / 2)
       .attr('y', d => (d.source.y + d.target.y) / 2);
 
-    nodeGroup.selectAll('circle')
-      .attr('cx', d => d.x)
-      .attr('cy', d => d.y);
+    nodeGroup.selectAll('g.node-group')
+      .attr('transform', d => `translate(${d.x},${d.y})`);
 
     labelGroup.selectAll('text')
       .attr('x', d => d.x)
-      .attr('y', d => d.y + NODE_RADIUS + 14);
+      .attr('y', d => d.y + GLOW_RADIUS + 12);
   }
 
   function update(nodes, edges) {
@@ -107,23 +163,53 @@ const GraphViz = (() => {
       .attr('class', 'graph-link-label')
       .text(d => d.label || '');
 
-    // Nodes
-    const node = nodeGroup.selectAll('circle').data(currentNodes, d => d.id);
-    node.exit().remove();
-    const nodeEnter = node.enter().append('circle')
-      .attr('r', 0)
-      .attr('fill', d => NODE_COLORS[d.type] || '#3b82f6')
-      .attr('stroke', '#0a0e17')
-      .attr('stroke-width', 2)
+    // Node groups
+    const nodeG = nodeGroup.selectAll('g.node-group').data(currentNodes, d => d.id);
+    nodeG.exit().remove();
+
+    const nodeEnter = nodeG.enter().append('g')
+      .attr('class', 'node-group')
       .attr('cursor', 'grab')
       .call(drag(simulation));
 
-    // Animate entrance
-    nodeEnter.transition().duration(400)
+    // Outer glow ring
+    nodeEnter.append('circle')
+      .attr('class', 'node-glow')
+      .attr('r', 0)
+      .attr('stroke', d => NODE_COLORS[d.type] || '#e8a634')
+      .attr('stroke-width', 1.5)
+      .attr('filter', d => `url(#glow-${d.type || 'machine'})`)
+      .transition().duration(500)
+      .ease(d3.easeElasticOut.amplitude(1).period(0.4))
+      .attr('r', GLOW_RADIUS);
+
+    // Inner filled circle
+    nodeEnter.append('circle')
+      .attr('class', 'node-fill')
+      .attr('r', 0)
+      .attr('fill', d => NODE_COLORS[d.type] || '#e8a634')
+      .attr('stroke', '#0c0c0c')
+      .attr('stroke-width', 2)
+      .transition().duration(500)
+      .ease(d3.easeElasticOut.amplitude(1).period(0.4))
       .attr('r', NODE_RADIUS);
 
-    // Update colors on existing nodes
-    node.attr('fill', d => NODE_COLORS[d.type] || '#3b82f6');
+    // Type icon letter
+    nodeEnter.append('text')
+      .attr('class', 'node-icon')
+      .text(d => NODE_ICONS[d.type] || '?')
+      .attr('opacity', 0)
+      .transition().delay(200).duration(300)
+      .attr('opacity', 1);
+
+    // Update existing node colors
+    nodeG.select('.node-glow')
+      .attr('stroke', d => NODE_COLORS[d.type] || '#e8a634')
+      .attr('filter', d => `url(#glow-${d.type || 'machine'})`);
+    nodeG.select('.node-fill')
+      .attr('fill', d => NODE_COLORS[d.type] || '#e8a634');
+    nodeG.select('.node-icon')
+      .text(d => NODE_ICONS[d.type] || '?');
 
     // Labels
     const label = labelGroup.selectAll('text').data(currentNodes, d => d.id);
@@ -133,10 +219,21 @@ const GraphViz = (() => {
       .text(d => d.label || d.id);
     label.text(d => d.label || d.id);
 
+    // Update node count
+    nodeCount = currentNodes.length;
+
     // Restart simulation
     simulation.nodes(currentNodes);
     simulation.force('link').links(currentLinks);
     simulation.alpha(0.3).restart();
+  }
+
+  function getNodeCount() {
+    return nodeCount;
+  }
+
+  function getNodes() {
+    return currentNodes;
   }
 
   function drag(sim) {
@@ -157,5 +254,5 @@ const GraphViz = (() => {
       });
   }
 
-  return { init, update };
+  return { init, update, getNodeCount, getNodes };
 })();

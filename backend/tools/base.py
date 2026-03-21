@@ -4,7 +4,7 @@ from typing import Callable
 # Global tool registry: name -> {function, schema, phases}
 TOOL_REGISTRY: dict[str, dict] = {}
 
-OUTPUT_CAP = 8 * 1024  # 8KB max output (was 15KB — saves ~7KB per tool call in context)
+OUTPUT_CAP = 8 * 1024  # 8KB max output
 TIMEOUT = 120  # seconds
 
 
@@ -23,7 +23,7 @@ def tool(name: str, description: str, parameters: dict, phases: list[str]):
 
 def get_tools_for_phase(phase: str) -> list[dict]:
     """Get OpenAI-format tool schemas available for a given phase."""
-    phase_order = ['enumeration', 'vuln_analysis', 'exploitation', 'privesc']
+    phase_order = ['enumeration', 'exploitation', 'privesc']
     current_idx = phase_order.index(phase) if phase in phase_order else 0
     available_phases = phase_order[:current_idx + 1]
 

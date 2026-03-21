@@ -5,11 +5,15 @@ Architecture:
   - ContextManager compresses old messages to prevent token bloat
   - Knowledge base provides instant exploit recognition
   - Graph + frontend provide real-time visualization
-  - Phase model guides but doesn't restrict — agent can skip phases
+  - Adaptive strategy engine auto-advances phases based on state
+  - Planning/reflection prompts force structured reasoning
 """
 
 import json
+import os
 import re
+import shutil
+import subprocess
 import time
 import inspect
 from pathlib import Path
@@ -29,7 +33,7 @@ from backend.parsers import TOOL_PARSERS, STATE_EXTRACTORS
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
-PHASES = ['enumeration', 'vuln_analysis', 'exploitation', 'privesc']
+PHASES = ['enumeration', 'exploitation', 'privesc']
 MAX_ITERATIONS_PER_PHASE = 15
 MAX_TOTAL_ITERATIONS = 60
 
@@ -81,7 +85,7 @@ META_TOOLS = [
                 'properties': {
                     'next_phase': {
                         'type': 'string',
-                        'enum': ['vuln_analysis', 'exploitation', 'privesc', 'complete'],
+                        'enum': ['exploitation', 'privesc', 'complete'],
                         'description': 'The phase to transition to',
                     },
                     'reason': {'type': 'string', 'description': 'Why you are transitioning'},
@@ -125,6 +129,9 @@ TOOL_HINTS = {
     'check_sudo': 'HINT: You MUST provide a full sshpass SSH command. Use: sshpass -p \'PASS\' ssh -o StrictHostKeyChecking=no USER@TARGET \'sudo -l\'',
     'check_suid': 'HINT: You MUST provide a full sshpass SSH command to run this remotely on the target.',
     'check_cron': 'HINT: You MUST provide a full sshpass SSH command to run this remotely on the target.',
+    'sqlmap_scan': 'HINT: Ensure the target URL has a parameter to test (e.g. ?id=1). Try with --level=3 --risk=2 for deeper testing.',
+    'hydra_brute': 'HINT: Verify the service is running and accessible. Try fewer credentials or a different protocol.',
+    'wpscan': 'HINT: Ensure the target is running WordPress. Check the URL (usually /wp-login.php exists).',
 }
 
 
@@ -180,6 +187,55 @@ def _add_tool_hint(name: str, args: dict, error_msg: str) -> str:
     return f"{error_msg} {hint}"
 
 
+def _find_terminal() -> str | None:
+    """Find an available terminal emulator for spawning shell sessions."""
+    for term in ['gnome-terminal', 'konsole', 'xfce4-terminal', 'kitty', 'alacritty', 'xterm']:
+        if shutil.which(term):
+            return term
+    return None
+
+
+def _spawn_terminal_ssh(host: str, user: str, password: str, terminal: str):
+    """Spawn a new terminal window with an SSH session to the target."""
+    ssh_cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no {user}@{host}"
+    title = f"Lacuna Shell — {user}@{host}"
+
+    try:
+        if terminal == 'gnome-terminal':
+            subprocess.Popen([
+                'gnome-terminal', '--title', title, '--',
+                'bash', '-c', f'{ssh_cmd}; echo "--- Session ended. Press Enter to close ---"; read'
+            ], start_new_session=True)
+        elif terminal == 'konsole':
+            subprocess.Popen([
+                'konsole', '--title', title, '-e',
+                'bash', '-c', f'{ssh_cmd}; echo "--- Session ended. Press Enter to close ---"; read'
+            ], start_new_session=True)
+        elif terminal == 'xfce4-terminal':
+            subprocess.Popen([
+                'xfce4-terminal', '--title', title, '-e',
+                f'bash -c \'{ssh_cmd}; echo "--- Session ended. Press Enter to close ---"; read\''
+            ], start_new_session=True)
+        elif terminal == 'kitty':
+            subprocess.Popen([
+                'kitty', '--title', title,
+                'bash', '-c', f'{ssh_cmd}; echo "--- Session ended. Press Enter to close ---"; read'
+            ], start_new_session=True)
+        elif terminal == 'alacritty':
+            subprocess.Popen([
+                'alacritty', '--title', title, '-e',
+                'bash', '-c', f'{ssh_cmd}; echo "--- Session ended. Press Enter to close ---"; read'
+            ], start_new_session=True)
+        elif terminal == 'xterm':
+            subprocess.Popen([
+                'xterm', '-title', title, '-e',
+                f'bash -c \'{ssh_cmd}; echo "--- Session ended. Press Enter to close ---"; read\''
+            ], start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
 class Agent:
     def __init__(self, target: str, manager: WSManager, lhost: str = ''):
         self.target = target
@@ -202,26 +258,34 @@ class Agent:
         self._phase_entry_node_count = 0
         self._last_nudge_iteration = -99
         self._knowledge_injected: set[str] = set()
-        self.total_cost = 0.0  # estimated USD spend
+        self.total_cost = 0.0
         self.total_cached_tokens = 0
-        self._tool_failures: dict[str, int] = {}  # tool_name -> consecutive failure count
+        self._tool_failures: dict[str, int] = {}
+        # Reasoning layer tracking
+        self._plan_injected_for_phase: set[str] = set()
+        self._phase_failure_count: int = 0
+        self._reflection_injected_at: int = -99
+        self._current_strategy: str = ''
+        # Iteration counter for context windowing
+        self._iteration_counter: int = 0
+        # Shell session tracking
+        self._spawned_sessions: set[str] = set()  # "user@host" keys
+        self._terminal = _find_terminal()
+        # Track previous access count for detecting new access
+        self._prev_access_count: int = 0
 
     # ── System prompt construction ───────────────────────────────
-    # Structured for OpenAI prompt caching: static prefix first, dynamic state last.
-    # OpenAI caches the matching prefix at 50% off — the static instructions are
-    # the same across all calls within a phase, so they get cached automatically.
-
     def _build_system_prompt(self) -> str:
-        # STATIC PREFIX — cached by OpenAI after first call
+        # STATIC PREFIX
         system = load_prompt("system.md")
         lhost = f"\nLHOST: {self.lhost}" if self.lhost else ""
         static = f"{system}\n\nTarget: {self.target}{lhost}"
 
-        # SEMI-STATIC — cached within a phase (changes on phase transition)
+        # SEMI-STATIC — changes on phase transition
         phase_prompt = load_prompt(f"{self.phase}.md")
         semi_static = f"\n\n## Phase: {self.phase}\n{phase_prompt}"
 
-        # DYNAMIC — changes every iteration (not cached)
+        # DYNAMIC — changes every iteration
         dynamic_parts = []
 
         state_summary = self.state.get_prompt_summary()
@@ -232,7 +296,11 @@ class Agent:
         if knowledge:
             dynamic_parts.append(knowledge)
 
-        # Brief graph count instead of full summary — state already has all actionable info
+        # Tool suggestions based on current state
+        suggestions = self._get_tool_suggestions()
+        if suggestions:
+            dynamic_parts.append(suggestions)
+
         graph_brief = self.graph.get_brief_summary()
         if graph_brief:
             dynamic_parts.append(graph_brief)
@@ -251,6 +319,8 @@ class Agent:
                 continue
             matches = match_service_to_exploits(svc.name, svc.version)
             for exploit in matches:
+                if exploit.get('severity') not in ('critical', 'high'):
+                    continue  # Only auto-inject critical/high matches
                 cve = f" ({exploit['cve']})" if exploit.get('cve') else ""
                 hints.append(
                     f"- **{svc.name} {svc.version}** on port {svc.port}: "
@@ -262,6 +332,45 @@ class Agent:
             return "## Known Exploits Detected\n" + '\n'.join(hints)
         return ""
 
+    def _get_tool_suggestions(self) -> str:
+        """Generate brief tool hints based on current state patterns."""
+        suggestions = []
+
+        # Web service found but not scanned
+        web_ports = [svc for svc in self.state.services.values()
+                     if svc.name in ('http', 'https', 'http-proxy')]
+        if web_ports and self._tool_call_count < 5:
+            for svc in web_ports:
+                suggestions.append(
+                    f"Web service on port {svc.port} — consider gobuster_dir or curl_request"
+                )
+
+        # Untested credentials exist
+        untested = self.state.get_untested_pairs()
+        if untested:
+            for cred, services in untested[:2]:
+                suggestions.append(
+                    f"UNTESTED CRED: {cred.username}:{cred.password} — try on {', '.join(services)}"
+                )
+
+        # Have user access but no root — suggest privesc tools
+        has_user = any(a.level == 'user' for a in self.state.accesses)
+        has_root = self.state.has_root(self.target)
+        if has_user and not has_root and self.phase == 'privesc':
+            suggestions.append(
+                "User shell obtained — run check_sudo, check_suid, check_cron"
+            )
+
+        # Credentials found but still in enumeration
+        if self.state.credentials and self.phase == 'enumeration':
+            suggestions.append(
+                "Credentials discovered — consider transitioning to exploitation"
+            )
+
+        if suggestions:
+            return "## Suggested Actions\n" + '\n'.join(f"- {s}" for s in suggestions[:4])
+        return ""
+
     def _get_tools(self) -> list[dict]:
         phase_tools = get_tools_for_phase(self.phase)
         # Circuit breaker: exclude tools that have failed 2+ times consecutively
@@ -269,6 +378,167 @@ class Agent:
         if blocked:
             phase_tools = [t for t in phase_tools if t['function']['name'] not in blocked]
         return META_TOOLS + phase_tools
+
+    # ── Planning & Reflection (Reasoning Layer) ──────────────────
+
+    def _inject_planning_prompt(self) -> str:
+        """Force the agent to strategize before acting in a new phase."""
+        return (
+            f"[SYSTEM] You have entered the **{self.phase}** phase. Before taking any action, "
+            f"analyze your current position:\n"
+            f"1. What do you know so far? (services, credentials, access levels, vulnerabilities)\n"
+            f"2. What is your hypothesis for the attack path?\n"
+            f"3. What are your next 3 specific actions, in priority order?\n\n"
+            f"Respond with your analysis ONLY — do NOT call any tools in this response. "
+            f"Execute your plan on the next turn."
+        )
+
+    def _inject_reflection_prompt(self, failures: int) -> str:
+        """Force the agent to reflect after repeated failures."""
+        return (
+            f"[SYSTEM] You have had {failures} tool failures in the current phase. "
+            f"Stop and reflect:\n"
+            f"1. Why did these tools fail? What assumption is wrong?\n"
+            f"2. What is a fundamentally different approach you haven't tried?\n"
+            f"3. Should you transition to a different phase instead?\n\n"
+            f"Respond with your analysis ONLY — do NOT call any tools in this response. "
+            f"Then take a different approach on the next turn."
+        )
+
+    def _is_planning_response(self) -> bool:
+        """Check if the previous message was a [SYSTEM] planning/reflection prompt."""
+        if len(self.messages) < 2:
+            return False
+        prev = self.messages[-2]
+        return (prev.get('role') == 'user' and
+                isinstance(prev.get('content', ''), str) and
+                prev['content'].startswith('[SYSTEM]'))
+
+    # ── Adaptive Strategy Engine ─────────────────────────────────
+
+    async def _evaluate_strategy(self):
+        """Evaluate current state and auto-advance phases if warranted."""
+        L = self.logger
+        old_phase = self.phase
+
+        # Root + flag → complete immediately
+        if self.state.has_root(self.target) and 'root_flag' in self.state.loot:
+            L.log(f"{C_GREEN}{C_BOLD}STRATEGY: Root + flag detected — completing{C_RESET}")
+            self.phase = 'complete'
+            self._done = True
+            await self.manager.broadcast('phase_change', {'phase': 'complete'})
+            return
+
+        # User access + no root → jump to privesc
+        has_user = any(a.level == 'user' and a.host == self.target for a in self.state.accesses)
+        has_root = self.state.has_root(self.target)
+        if has_user and not has_root and self.phase in ('enumeration',):
+            L.log(f"{C_MAGENTA}{C_BOLD}STRATEGY: User access detected — jumping to privesc{C_RESET}")
+            self.phase = 'privesc'
+            self._phase_entry_iteration = self.total_iterations
+            self._phase_entry_node_count = len(self.graph.nodes)
+            await self.manager.broadcast('phase_change', {'phase': self.phase})
+            return
+
+        # Verified creds + no access → jump to exploitation
+        verified_creds = [c for c in self.state.credentials.values() if c.verified_for]
+        unverified_creds = [c for c in self.state.credentials.values()
+                           if not c.verified_for and not c.failed_for]
+        if (verified_creds or unverified_creds) and not has_user and self.phase == 'enumeration':
+            L.log(f"{C_MAGENTA}{C_BOLD}STRATEGY: Credentials found — jumping to exploitation{C_RESET}")
+            self.phase = 'exploitation'
+            self._phase_entry_iteration = self.total_iterations
+            self._phase_entry_node_count = len(self.graph.nodes)
+            await self.manager.broadcast('phase_change', {'phase': self.phase})
+            return
+
+        # Critical KB exploit match during enumeration → jump to exploitation
+        if self.phase == 'enumeration':
+            for svc in self.state.services.values():
+                matches = match_service_to_exploits(svc.name, svc.version)
+                critical_matches = [m for m in matches if m.get('severity') == 'critical']
+                if critical_matches:
+                    L.log(f"{C_MAGENTA}{C_BOLD}STRATEGY: Critical exploit match for {svc.name} — jumping to exploitation{C_RESET}")
+                    self.phase = 'exploitation'
+                    self._phase_entry_iteration = self.total_iterations
+                    self._phase_entry_node_count = len(self.graph.nodes)
+                    await self.manager.broadcast('phase_change', {'phase': self.phase})
+                    return
+
+        if self.phase != old_phase:
+            await self._broadcast_budget()
+
+    # ── Shell Session Management ─────────────────────────────────
+
+    async def _check_new_access(self):
+        """Check if new shell access was gained and handle it."""
+        L = self.logger
+        current_count = len(self.state.accesses)
+        if current_count <= self._prev_access_count:
+            return
+
+        # New access detected
+        for access in self.state.accesses[self._prev_access_count:]:
+            session_key = f"{access.user}@{access.host}"
+            if session_key in self._spawned_sessions:
+                continue
+
+            level_str = "ROOT" if access.level == "root" else "USER"
+            L.log(f"{C_GREEN}{C_BOLD}SHELL ACCESS: {level_str} shell as {access.user}@{access.host} via {access.method}{C_RESET}")
+
+            # Find credentials for this access
+            ssh_cmd = ""
+            password = ""
+            for cred in self.state.credentials.values():
+                if cred.username == access.user and ('ssh' in cred.verified_for or cred.verified_for):
+                    password = cred.password
+                    ssh_cmd = f"sshpass -p '{cred.password}' ssh -o StrictHostKeyChecking=no {cred.username}@{access.host}"
+                    break
+            if not ssh_cmd and access.credential:
+                password = access.credential.password
+                ssh_cmd = f"sshpass -p '{access.credential.password}' ssh -o StrictHostKeyChecking=no {access.credential.username}@{access.host}"
+            if not ssh_cmd:
+                # Try any credential with matching username
+                for cred in self.state.credentials.values():
+                    if cred.username == access.user:
+                        password = cred.password
+                        ssh_cmd = f"sshpass -p '{cred.password}' ssh -o StrictHostKeyChecking=no {cred.username}@{access.host}"
+                        break
+
+            # Broadcast shell access to frontend
+            await self.manager.broadcast('shell_access', {
+                'host': access.host,
+                'user': access.user,
+                'level': access.level,
+                'method': access.method,
+                'ssh_command': ssh_cmd,
+                'timestamp': time.strftime('%H:%M:%S'),
+            })
+
+            # Attempt to spawn a local terminal
+            if ssh_cmd and self._terminal and password:
+                spawned = _spawn_terminal_ssh(access.host, access.user, password, self._terminal)
+                if spawned:
+                    L.log(f"{C_CYAN}Spawned {self._terminal} with SSH session for {session_key}{C_RESET}")
+                    self._spawned_sessions.add(session_key)
+                else:
+                    L.log(f"{C_YELLOW}Failed to spawn terminal for {session_key}{C_RESET}")
+            elif not self._terminal:
+                L.log(f"{C_YELLOW}No terminal emulator found — shell info sent to dashboard{C_RESET}")
+
+            self._spawned_sessions.add(session_key)
+
+        self._prev_access_count = current_count
+
+    # ── Budget broadcasting ──────────────────────────────────────
+
+    async def _broadcast_budget(self):
+        remaining = max(0, 30 - self._tool_call_count)
+        await self.manager.broadcast('budget_update', {
+            'remaining': remaining,
+            'total': 30,
+            'used': self._tool_call_count,
+        })
 
     # ── Main agent loop ──────────────────────────────────────────
 
@@ -289,6 +559,7 @@ class Agent:
         self.graph.add_node(self.target, self.target, 'machine')
         await self._broadcast_graph()
         await self.manager.broadcast('phase_change', {'phase': self.phase})
+        await self._broadcast_budget()
 
         self.messages.append({
             'role': 'user',
@@ -302,9 +573,18 @@ class Agent:
         while self.phase != 'complete' and self.total_iterations < MAX_TOTAL_ITERATIONS and not self._done:
             phase_iterations = 0
             consecutive_stops = 0
+            self._phase_failure_count = 0
+
+            # ── Planning injection at phase entry ─────────────
+            if self.phase not in self._plan_injected_for_phase and self.total_iterations > 0:
+                planning_msg = self._inject_planning_prompt()
+                self.messages.append({'role': 'user', 'content': planning_msg})
+                self._plan_injected_for_phase.add(self.phase)
+                L.log(f"{C_CYAN}Injected planning prompt for {self.phase}{C_RESET}")
 
             while phase_iterations < MAX_ITERATIONS_PER_PHASE and self.total_iterations < MAX_TOTAL_ITERATIONS:
                 self.total_iterations += 1
+                self._iteration_counter += 1
                 phase_iterations += 1
 
                 # ── Stagnation detection ─────────────────────────
@@ -321,6 +601,15 @@ class Agent:
                     self._last_nudge_iteration = self.total_iterations
                     L.log(f"{C_YELLOW}Stagnation nudge (iter {iters_in_phase}, 0 new nodes){C_RESET}")
 
+                # ── Reflection injection after failures ──────────
+                if (self._phase_failure_count >= 2 and
+                        self.total_iterations - self._reflection_injected_at > 3):
+                    reflection_msg = self._inject_reflection_prompt(self._phase_failure_count)
+                    self.messages.append({'role': 'user', 'content': reflection_msg})
+                    self._reflection_injected_at = self.total_iterations
+                    self._phase_failure_count = 0
+                    L.log(f"{C_YELLOW}Injected reflection prompt after {self._phase_failure_count} failures{C_RESET}")
+
                 # ── Auto-complete if root flag found ─────────────
                 if self.state.has_root(self.target) and 'root_flag' in self.state.loot:
                     L.log(f"{C_GREEN}{C_BOLD}ROOT + FLAG DETECTED — auto-completing{C_RESET}")
@@ -332,7 +621,7 @@ class Agent:
 
                 # ── Build context-managed message list ───────────
                 system_prompt = self._build_system_prompt()
-                messages = build_messages(system_prompt, self.messages)
+                messages = build_messages(system_prompt, self.messages, self._iteration_counter)
                 tools = self._get_tools()
 
                 L.log(f"{C_CYAN}Calling LLM ({len(messages)} messages, {len(tools)} tools)...{C_RESET}")
@@ -364,7 +653,16 @@ class Agent:
                     L.log(f"{C_YELLOW}Thinking: {text}{C_RESET}")
                     await self.manager.broadcast('agent_thinking', {'text': message.content})
 
-                assistant_msg = {'role': 'assistant', 'content': message.content or ''}
+                    # If this was a response to a planning/reflection prompt, broadcast as strategy
+                    if self._is_planning_response():
+                        self._current_strategy = message.content
+                        await self.manager.broadcast('strategy_update', {
+                            'strategy': message.content,
+                            'phase': self.phase,
+                        })
+                        L.log(f"{C_CYAN}Strategy update broadcast{C_RESET}")
+
+                assistant_msg = {'role': 'assistant', 'content': message.content or '', '_iteration': self._iteration_counter}
                 if message.tool_calls:
                     assistant_msg['tool_calls'] = [
                         {
@@ -428,6 +726,7 @@ class Agent:
                         L.log(f"{C_YELLOW}Cache hit: {name}{C_RESET}")
                     else:
                         self._tool_call_count += 1
+                        await self._broadcast_budget()
                         tool_start = time.time()
                         result = await self._execute_tool(name, args)
                         tool_time = time.time() - tool_start
@@ -440,10 +739,11 @@ class Agent:
                     # Circuit breaker: track consecutive failures per tool
                     if result.startswith('[ERROR]') or result.startswith('[TIMEOUT'):
                         self._tool_failures[name] = self._tool_failures.get(name, 0) + 1
+                        self._phase_failure_count += 1
                         if self._tool_failures[name] >= 2:
                             L.log(f"{C_RED}Circuit breaker: {name} failed {self._tool_failures[name]}x — temporarily disabled{C_RESET}")
                     else:
-                        self._tool_failures.pop(name, None)  # reset on success
+                        self._tool_failures.pop(name, None)
 
                     # ── Auto-update graph ────────────────────────
                     parsed = None
@@ -461,11 +761,20 @@ class Agent:
                     if name in STATE_EXTRACTORS and not result.startswith('[ERROR]'):
                         STATE_EXTRACTORS[name](result, self.target, self.state)
 
+                    # ── Check for new shell access ───────────────
+                    await self._check_new_access()
+
+                    # ── Adaptive strategy: evaluate after state update
+                    await self._evaluate_strategy()
+                    if self._done:
+                        should_break = True
+
                     await self.manager.broadcast('tool_result', {'id': call_id, 'result': result, 'error': False})
                     self.messages.append({
                         'role': 'tool',
                         'tool_call_id': call_id,
                         'content': result,
+                        '_iteration': self._iteration_counter,
                     })
 
                     # ── Phase transition ─────────────────────────
@@ -489,6 +798,7 @@ class Agent:
                         L.log(f"{C_MAGENTA}Reason: {args.get('reason', 'N/A')}{C_RESET}")
                         L.log(f"{C_MAGENTA}{'='*40}{C_RESET}\n")
                         await self.manager.broadcast('phase_change', {'phase': self.phase})
+                        await self._broadcast_budget()
                         should_break = True
 
                 if should_break:

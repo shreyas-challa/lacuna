@@ -12,7 +12,7 @@ from backend.tools.base import tool, run_command
         },
         'required': ['target'],
     },
-    phases=['vuln_analysis'],
+    phases=['enumeration'],
 )
 async def nuclei_scan(target: str, flags: str = '') -> str:
     return await run_command(f'nuclei -u {target} -nc {flags}', timeout=300)
@@ -28,7 +28,7 @@ async def nuclei_scan(target: str, flags: str = '') -> str:
         },
         'required': ['query'],
     },
-    phases=['vuln_analysis'],
+    phases=['enumeration'],
 )
 async def searchsploit(query: str) -> str:
     return await run_command(f'searchsploit {query}')
@@ -45,7 +45,7 @@ async def searchsploit(query: str) -> str:
         },
         'required': ['target'],
     },
-    phases=['vuln_analysis'],
+    phases=['enumeration'],
 )
 async def nikto_scan(target: str, flags: str = '') -> str:
     return await run_command(f'nikto -h {target} {flags}', timeout=300)

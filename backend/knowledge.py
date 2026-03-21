@@ -401,6 +401,56 @@ def get_gtfobins_for_binary(binary: str) -> dict[str, str] | None:
     return GTFOBINS.get(base)
 
 
+def query_knowledge_base(query: str, category: str = "all") -> str:
+    """Query the knowledge base for exploits, GTFOBins, default creds, or reverse shells.
+
+    Zero-cost tool — no subprocess, instant lookup from in-memory data.
+    """
+    query_lower = query.lower().strip()
+    results = []
+
+    # GTFOBins lookup
+    if category in ("all", "gtfobins", "privesc"):
+        for binary, techniques in GTFOBINS.items():
+            if binary in query_lower or query_lower in binary:
+                lines = [f"## GTFOBins: {binary}"]
+                for method, cmd in techniques.items():
+                    lines.append(f"  - {method}: `{cmd}`")
+                results.append('\n'.join(lines))
+
+    # Known exploits lookup
+    if category in ("all", "exploits", "cve"):
+        for key, exploit in KNOWN_EXPLOITS.items():
+            if key.lower() in query_lower or query_lower in key.lower():
+                cve = f" ({exploit['cve']})" if exploit.get('cve') else ""
+                results.append(
+                    f"## Exploit: {key}{cve}\n"
+                    f"  Severity: {exploit['severity']}\n"
+                    f"  {exploit['description']}\n"
+                    f"  Command: `{exploit['exploit']}`"
+                )
+
+    # Default credentials lookup
+    if category in ("all", "creds", "credentials"):
+        for service, cred_list in DEFAULT_CREDENTIALS.items():
+            if service in query_lower or query_lower in service:
+                lines = [f"## Default Credentials: {service}"]
+                for user, passwd in cred_list:
+                    lines.append(f"  - {user}:{passwd}")
+                results.append('\n'.join(lines))
+
+    # Reverse shells lookup
+    if category in ("all", "shells", "reverse"):
+        for lang, shell in REVERSE_SHELLS.items():
+            if lang in query_lower or query_lower in lang or category == "shells":
+                results.append(f"## Reverse Shell ({lang}):\n  `{shell}`")
+
+    if not results:
+        return f"No knowledge base matches for '{query}'. Try a more specific query or different category (gtfobins, exploits, creds, shells)."
+
+    return '\n\n'.join(results)
+
+
 def get_privesc_advice(sudo_output: str = "", suid_binaries: list[str] = None,
                        capabilities: str = "") -> list[str]:
     """Analyze privesc enumeration output and return actionable advice."""

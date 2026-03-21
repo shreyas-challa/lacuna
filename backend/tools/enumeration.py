@@ -1,5 +1,6 @@
 import os
 from backend.tools.base import tool, run_command
+from backend.knowledge import query_knowledge_base
 
 WORDLIST = os.path.join(os.path.dirname(__file__), '..', '..', 'wordlists', 'common.txt')
 
@@ -169,6 +170,28 @@ async def download_and_analyze(url: str, filename: str) -> str:
 )
 async def execute_command_enum(command: str) -> str:
     return await run_command(command)
+
+
+@tool(
+    name='query_kb',
+    description='Query the built-in knowledge base for GTFOBins privesc techniques, known exploits/CVEs, default credentials, or reverse shell one-liners. Zero-cost — no subprocess or network call.',
+    parameters={
+        'type': 'object',
+        'properties': {
+            'query': {'type': 'string', 'description': 'Search query (e.g. "python3", "tomcat", "vsftpd 2.3.4", "bash reverse shell")'},
+            'category': {
+                'type': 'string',
+                'enum': ['all', 'gtfobins', 'exploits', 'creds', 'shells'],
+                'description': 'Category to search (default: all)',
+                'default': 'all',
+            },
+        },
+        'required': ['query'],
+    },
+    phases=['enumeration'],
+)
+async def query_kb(query: str, category: str = 'all') -> str:
+    return query_knowledge_base(query, category)
 
 
 def _resolve_wordlist(wordlist: str) -> str:

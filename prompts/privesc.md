@@ -1,4 +1,4 @@
-## Phase 4: Privilege Escalation
+## Phase 3: Privilege Escalation
 
 Escalate to root. ALL commands must be run on the TARGET via sshpass — check the attack graph for credentials.
 
@@ -11,6 +11,8 @@ Every command: `sshpass -p 'PASSWORD' ssh -o StrictHostKeyChecking=no USER@TARGE
 3. SUID binaries: `find / -perm -4000 -type f 2>/dev/null`
 4. Cron jobs: `cat /etc/crontab; ls -la /etc/cron.d/`
 5. LinPEAS only if above checks find nothing
+
+Use `query_kb` to look up GTFOBins techniques for any interesting binary you find.
 
 ### Exploiting Capabilities
 If you find `cap_setuid` on python:

@@ -113,6 +113,69 @@ def parse_pcap_analysis(output: str, target: str) -> dict:
         return {'nodes': [], 'edges': []}
 
 
+def parse_sqlmap(output: str, target: str) -> dict:
+    """Extract injection points and databases from sqlmap output."""
+    try:
+        nodes, edges = [], []
+        # Detect injectable parameters
+        for m in re.finditer(r"Parameter:\s*(\S+)\s.*is\s+(.*vulnerable)", output, re.IGNORECASE):
+            param = m.group(1)
+            node_id = f'vuln-sqli-{param}'
+            nodes.append({'id': node_id, 'label': f'SQLi: {param}', 'type': 'vulnerability'})
+            edges.append({'source': target, 'target': node_id, 'label': 'sqli'})
+        # Detect databases
+        for m in re.finditer(r'\[\*\]\s+(\w+)', output):
+            db = m.group(1)
+            if db not in ('information_schema', 'performance_schema', 'mysql', 'sys', 'starting', 'testing', 'shutting'):
+                node_id = f'db-{db}'
+                nodes.append({'id': node_id, 'label': f'DB: {db}', 'type': 'service'})
+                edges.append({'source': target, 'target': node_id, 'label': 'database'})
+        return {'nodes': nodes, 'edges': edges}
+    except Exception:
+        return {'nodes': [], 'edges': []}
+
+
+def parse_hydra(output: str, target: str) -> dict:
+    """Extract cracked credentials from hydra output."""
+    try:
+        nodes, edges = [], []
+        for m in re.finditer(r'\[(\d+)\]\[(\w+)\]\s+host:\s+\S+\s+login:\s+(\S+)\s+password:\s+(\S+)', output):
+            port, service, user, passwd = m.groups()
+            node_id = f'cred-{user}-{passwd[:20]}'
+            nodes.append({'id': node_id, 'label': f'Cred: {user}:{passwd}', 'type': 'user'})
+            edges.append({'source': target, 'target': node_id, 'label': f'{service} brute'})
+        return {'nodes': nodes, 'edges': edges}
+    except Exception:
+        return {'nodes': [], 'edges': []}
+
+
+def parse_wpscan(output: str, target: str) -> dict:
+    """Extract WordPress users, plugins, and vulnerabilities from wpscan output."""
+    try:
+        nodes, edges = [], []
+        # Users
+        for m in re.finditer(r'\|\s+(\w+)\s+\|.*Author', output):
+            user = m.group(1)
+            node_id = f'wp-user-{user}'
+            nodes.append({'id': node_id, 'label': f'WP User: {user}', 'type': 'user'})
+            edges.append({'source': target, 'target': node_id, 'label': 'wordpress'})
+        # Also catch user enumeration format
+        for m in re.finditer(r'(?:Identified|Found).*user.*?:\s*(\w+)', output, re.IGNORECASE):
+            user = m.group(1)
+            node_id = f'wp-user-{user}'
+            nodes.append({'id': node_id, 'label': f'WP User: {user}', 'type': 'user'})
+            edges.append({'source': target, 'target': node_id, 'label': 'wordpress'})
+        # Vulnerabilities
+        for m in re.finditer(r'Title:\s*(.+)', output):
+            title = m.group(1).strip()[:60]
+            node_id = f'wp-vuln-{title[:30].replace(" ", "-").lower()}'
+            nodes.append({'id': node_id, 'label': title, 'type': 'vulnerability'})
+            edges.append({'source': target, 'target': node_id, 'label': 'wp-vuln'})
+        return {'nodes': nodes, 'edges': edges}
+    except Exception:
+        return {'nodes': [], 'edges': []}
+
+
 # Graph parser registry
 TOOL_PARSERS = {
     'nmap_scan': parse_nmap,
@@ -121,6 +184,9 @@ TOOL_PARSERS = {
     'nuclei_scan': parse_nuclei,
     'searchsploit': parse_searchsploit,
     'download_and_analyze': parse_pcap_analysis,
+    'sqlmap_scan': parse_sqlmap,
+    'hydra_brute': parse_hydra,
+    'wpscan': parse_wpscan,
 }
 
 
@@ -244,6 +310,52 @@ def extract_state_from_pcap(output: str, target: str, state: StateManager):
         pass
 
 
+def extract_state_from_sqlmap(output: str, target: str, state: StateManager):
+    """Extract injection points and databases from sqlmap output."""
+    try:
+        for m in re.finditer(r"Parameter:\s*(\S+)", output):
+            state.add_finding(
+                title=f'SQL Injection: {m.group(1)}',
+                severity='critical', service=target,
+                description=f'Injectable parameter: {m.group(1)}',
+            )
+        # Extract credentials if --dump was used
+        for m in re.finditer(r'\|\s+(\S+)\s+\|\s+(\S{4,})\s+\|', output):
+            user, passwd = m.groups()
+            if user.lower() not in ('username', 'user', 'name', 'id', 'email', '---'):
+                state.add_credential(user, passwd, source='sqlmap_dump')
+    except Exception:
+        pass
+
+
+def extract_state_from_hydra(output: str, target: str, state: StateManager):
+    """Extract cracked credentials from hydra output."""
+    try:
+        for m in re.finditer(r'\[(\d+)\]\[(\w+)\]\s+host:\s+\S+\s+login:\s+(\S+)\s+password:\s+(\S+)', output):
+            port, service, user, passwd = m.groups()
+            state.add_credential(user, passwd, source=f'hydra_{service}')
+            state.mark_credential_verified(user, passwd, service)
+    except Exception:
+        pass
+
+
+def extract_state_from_wpscan(output: str, target: str, state: StateManager):
+    """Extract WordPress findings from wpscan output."""
+    try:
+        for m in re.finditer(r'(?:Identified|Found).*user.*?:\s*(\w+)', output, re.IGNORECASE):
+            user = m.group(1)
+            state.add_credential(user, '', source='wpscan_enum')
+        for m in re.finditer(r'Title:\s*(.+)', output):
+            title = m.group(1).strip()
+            state.add_finding(
+                title=f'WP: {title[:60]}',
+                severity='high', service=target,
+                description=title,
+            )
+    except Exception:
+        pass
+
+
 # State extractor registry
 STATE_EXTRACTORS = {
     'nmap_scan': extract_state_from_nmap,
@@ -255,4 +367,8 @@ STATE_EXTRACTORS = {
     'run_linpeas': extract_state_from_command,
     'curl_request': extract_state_from_command,
     'send_payload': extract_state_from_command,
+    'sqlmap_scan': extract_state_from_sqlmap,
+    'hydra_brute': extract_state_from_hydra,
+    'wpscan': extract_state_from_wpscan,
+    'msfconsole_run': extract_state_from_command,
 }

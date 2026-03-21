@@ -1,19 +1,27 @@
-// Tool call log display
+// Tool call log display — Phosphor theme
 
 const ToolPanel = (() => {
   const log = document.getElementById('tool-log');
   const entries = {};
+  let currentPhase = 'recon';
+  let toolCount = 0;
+
+  function setPhase(phase) {
+    currentPhase = phase;
+  }
 
   function addToolCall(id, name, args) {
+    toolCount++;
     const entry = document.createElement('div');
-    entry.className = 'tool-entry';
+    entry.className = 'tool-entry running';
+    entry.setAttribute('data-phase', currentPhase);
     entry.innerHTML = `
       <div class="tool-header" onclick="ToolPanel.toggle('${id}')">
-        <span class="tool-name">${name}</span>
-        <span class="tool-status running">running</span>
+        <span class="tool-name">${escapeHtml(name)}</span>
+        <span class="tool-status running">RUNNING</span>
       </div>
       <div class="tool-body" id="tool-body-${id}">
-        <strong>Args:</strong> ${JSON.stringify(args, null, 2)}
+        <strong>Args:</strong> ${escapeHtml(JSON.stringify(args, null, 2))}
       </div>
     `;
     log.prepend(entry);
@@ -24,13 +32,15 @@ const ToolPanel = (() => {
     const entry = entries[id];
     if (!entry) return;
 
+    entry.classList.remove('running');
+
     const status = entry.querySelector('.tool-status');
     if (error) {
       status.className = 'tool-status error';
-      status.textContent = 'error';
+      status.textContent = 'ERR';
     } else {
       status.className = 'tool-status done';
-      status.textContent = 'done';
+      status.textContent = 'OK';
     }
 
     const body = entry.querySelector('.tool-body');
@@ -50,11 +60,15 @@ const ToolPanel = (() => {
     if (body) body.classList.toggle('open');
   }
 
+  function getToolCount() {
+    return toolCount;
+  }
+
   function escapeHtml(str) {
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
   }
 
-  return { addToolCall, updateToolResult, addThinking, toggle };
+  return { addToolCall, updateToolResult, addThinking, toggle, setPhase, getToolCount };
 })();
