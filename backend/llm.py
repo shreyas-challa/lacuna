@@ -1,10 +1,14 @@
 import os
+import asyncio
 from dotenv import load_dotenv
 from dedalus_labs import AsyncDedalus
 
 load_dotenv()
 
 MODEL = "anthropic/claude-opus-4-5-20251101"
+
+MAX_RETRIES = 3
+RETRY_DELAYS = [2, 5, 15]  # seconds between retries
 
 
 def get_client() -> AsyncDedalus:
@@ -16,7 +20,7 @@ def get_client() -> AsyncDedalus:
 
 
 async def chat_completion(client: AsyncDedalus, messages: list, tools: list | None = None):
-    """Call the LLM and return the raw response."""
+    """Call the LLM with automatic retry on transient failures."""
     kwargs = {
         'model': MODEL,
         'messages': messages,
@@ -26,5 +30,20 @@ async def chat_completion(client: AsyncDedalus, messages: list, tools: list | No
         kwargs['tools'] = tools
         kwargs['tool_choice'] = 'auto'
 
-    response = await client.chat.completions.create(**kwargs)
-    return response
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = await client.chat.completions.create(**kwargs)
+            return response
+        except Exception as e:
+            last_error = e
+            error_str = str(e).lower()
+            # Don't retry on auth errors or invalid requests
+            if 'auth' in error_str or 'invalid' in error_str or '401' in error_str or '400' in error_str:
+                raise
+            # Retry on rate limits, server errors, timeouts
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAYS[attempt]
+                await asyncio.sleep(delay)
+
+    raise last_error
