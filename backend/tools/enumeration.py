@@ -199,11 +199,59 @@ async def download_and_analyze(url: str, filename: str) -> str:
         if cred_strings.strip():
             parts.append(f"=== Credential Strings ===\n{cred_strings}")
         if len(parts) == 1:
-            # Nothing found via targeted queries — fall back to strings
-            fallback = await run_command(f'strings {filepath} | head -n 200', timeout=30)
-            parts.append(f"=== Strings (fallback) ===\n{fallback}")
+            # Nothing found via targeted queries — check if file is essentially empty
+            filesize = await run_command(f'wc -c < {filepath}', timeout=5)
+            size = int(filesize.strip()) if filesize.strip().isdigit() else 0
+            pkt_count = await run_command(f'tshark -r {filepath} -T fields -e frame.number 2>/dev/null | wc -l', timeout=10)
+            pkts = int(pkt_count.strip()) if pkt_count.strip().isdigit() else 0
+
+            if pkts == 0 or size < 100:
+                parts.append(
+                    f"=== EMPTY CAPTURE ===\n"
+                    f"This pcap has {pkts} packets ({size} bytes) — it contains NO useful data.\n"
+                    f"IMPORTANT: If the URL contains a numeric ID (e.g. /download/1), "
+                    f"try other IDs — especially /download/0 which often contains "
+                    f"pre-existing captures from other users with credentials."
+                )
+            else:
+                # Has some data but no creds found — fall back to strings
+                fallback = await run_command(f'strings {filepath} | head -n 200', timeout=30)
+                parts.append(f"=== Strings (fallback) ===\n{fallback}")
         return '\n\n'.join(parts)
-    elif ext in ('txt', 'conf', 'cfg', 'xml', 'json', 'html', 'php', 'py', 'sh', 'log'):
+    elif ext in ('js', 'jsx', 'ts'):
+        # Smart JS analysis: extract security-relevant patterns
+        parts = [f"Downloaded {filename} (HTTP {dl_result.strip()})"]
+
+        # Extract URL/API paths
+        api_hits = await run_command(
+            f"grep -oE '[\"\\x27](/[a-zA-Z0-9_/]{{3,}})[\"\\x27]' {filepath} | sort -u | head -30",
+            timeout=10,
+        )
+        if api_hits.strip():
+            parts.append(f"=== URL/API Paths ===\n{api_hits}")
+
+        # Extract security-relevant strings
+        interesting = await run_command(
+            f'grep -i -oE ".{{0,40}}(invite|token|secret|password|admin|auth|key|register|generate|verify|code|flag|credentials|session|cookie).{{0,40}}" {filepath} | head -30',
+            timeout=10,
+        )
+        if interesting.strip():
+            parts.append(f"=== Interesting References ===\n{interesting}")
+
+        # Extract HTTP call patterns
+        http_calls = await run_command(
+            f'grep -i -oE ".{{0,30}}(fetch\\(|\\$\\.ajax|\\$\\.post|\\$\\.get|XMLHttpRequest|axios\\.).{{0,60}}" {filepath} | head -20',
+            timeout=10,
+        )
+        if http_calls.strip():
+            parts.append(f"=== HTTP/API Calls ===\n{http_calls}")
+
+        # Include first 2KB of raw content for context
+        content = await run_command(f'head -c 2048 {filepath}', timeout=10)
+        parts.append(f"=== File Contents (first 2KB) ===\n{content}")
+
+        return '\n\n'.join(parts)
+    elif ext in ('txt', 'conf', 'cfg', 'xml', 'json', 'html', 'php', 'py', 'sh', 'log', 'css'):
         content = await run_command(f'cat {filepath}', timeout=10)
         return f"Downloaded {filename} (HTTP {dl_result.strip()})\n\n=== File Contents ===\n{content}"
     else:
@@ -215,21 +263,80 @@ async def download_and_analyze(url: str, filename: str) -> str:
 
 @tool(
     name='execute_command',
-    description='Execute an arbitrary shell command. Use this for ad-hoc tasks like analyzing files, chaining commands, or anything the specialized tools cannot do.',
+    description='Execute a shell command for TARGET interaction: curl to target, sshpass SSH, '
+                'file analysis, exploit compilation. Do NOT use for local system admin '
+                '(apt/dnf/pip), echo messages, or local recon (whoami/uname/ls without target context).',
     parameters={
         'type': 'object',
         'properties': {
-            'command': {'type': 'string', 'description': 'Shell command to execute'},
+            'command': {'type': 'string', 'description': 'Shell command to execute against or about the target'},
         },
         'required': ['command'],
     },
     phases=['enumeration'],
 )
 async def execute_command_enum(command: str) -> str:
-    # Reject hallucinated non-commands (LLM sometimes outputs text instead of a real command)
     cmd_stripped = command.strip()
+
+    # Reject hallucinated non-commands
     if not cmd_stripped or cmd_stripped.startswith('[') or cmd_stripped.startswith('{'):
         return "[ERROR] Invalid command — this is not a shell command. Use a real shell command or a dedicated tool."
+
+    # Block dangerous local system commands that should never run during a pentest
+    _BLOCKED_COMMANDS = (
+        'apt-get update', 'apt-get upgrade', 'apt-get install',
+        'apt update', 'apt upgrade', 'apt install',
+        'dnf update', 'dnf upgrade', 'dnf install',
+        'yum update', 'yum upgrade', 'yum install',
+        'pacman -S', 'pip install', 'npm install',
+        'rm -rf /', 'mkfs', 'dd if=',
+        'shutdown', 'reboot', 'poweroff', 'init 0', 'init 6',
+    )
+    cmd_lower = cmd_stripped.lower()
+    for blocked in _BLOCKED_COMMANDS:
+        if blocked in cmd_lower:
+            return f"[ERROR] Blocked — '{blocked}' modifies the LOCAL system, not the target. Focus on the target machine."
+
+    # Reject ALL echo commands that aren't piped/redirected to a target
+    # (status messages like "echo Preparing...", "echo Analysis ready", etc.)
+    if cmd_lower.startswith('echo ') and '|' not in cmd_stripped and '>>' not in cmd_stripped and 'tee' not in cmd_lower:
+        return "[ERROR] Do not echo status messages — call a tool that advances the engagement."
+
+    # Block purely local recon commands (not SSH'd to target)
+    _LOCAL_ONLY = ('whoami', 'uname -a', 'uname', 'uptime', 'hostname', 'id',
+                   'date', 'pwd', 'w', 'last', 'ps', 'ps aux', 'env')
+    if cmd_stripped in _LOCAL_ONLY:
+        return (
+            f"[ERROR] '{cmd_stripped}' runs on YOUR local machine, not the target. "
+            f"Use sshpass to run on the target, or use a dedicated tool (nmap_scan, curl_request, etc.)."
+        )
+
+    # Block local filesystem browsing that isn't target-related
+    # Allowed: ls /tmp/*.pcap, ls with target paths. Blocked: ls, ls /tmp, ls backend/, etc.
+    _LOCAL_LS_PATTERNS = (
+        'ls', 'ls -l', 'ls -la', 'ls -a', 'ls -al',
+        'ls /tmp', 'ls -l /tmp', 'ls -a /tmp', 'ls -la /tmp',
+        'ls backend', 'ls frontend', 'ls -l backend', 'ls -l frontend',
+    )
+    if cmd_stripped in _LOCAL_LS_PATTERNS or cmd_stripped.startswith('ls backend/') or cmd_stripped.startswith('ls frontend/'):
+        return (
+            "[ERROR] Browsing the local filesystem wastes iterations. "
+            "Use a dedicated tool: nmap_scan, curl_request, gobuster_dir, ffuf_fuzz, or query_kb."
+        )
+
+    # Block find/locate on the local system (wordlist hunting etc.)
+    if cmd_stripped.startswith('find /') and 'tmp/' not in cmd_stripped:
+        return "[ERROR] Searching the local filesystem wastes iterations. Use dedicated tools with keyword wordlists (e.g. gobuster_dir with wordlist='common')."
+
+    # Block cat/head/tail on local project files (not /tmp or target-downloaded files)
+    for reader in ('cat ', 'head ', 'tail ', 'sed ', 'less ', 'more '):
+        if cmd_stripped.startswith(reader):
+            target_path = cmd_stripped[len(reader):].strip().split()[0] if cmd_stripped[len(reader):].strip() else ''
+            if target_path and not target_path.startswith('/tmp') and not target_path.startswith('/dev'):
+                # Allow reading /etc/hosts and similar system files needed for pentest
+                if not target_path.startswith('/etc/'):
+                    return f"[ERROR] Reading local project files wastes iterations. Focus on the target."
+
     return await run_command(command)
 
 

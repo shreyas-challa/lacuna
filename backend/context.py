@@ -13,6 +13,7 @@ Strategy:
 """
 
 from __future__ import annotations
+import re
 
 # Max chars for tool results in recent messages
 RESULT_CAP = 4000
@@ -103,6 +104,21 @@ def _cap_recent(msg: dict) -> dict:
     return clean
 
 
+def _extract_key_refs(content: str) -> str:
+    """Extract HTML asset references to preserve during compression."""
+    refs = []
+    for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', content, re.IGNORECASE):
+        refs.append(f'script:{m.group(1)}')
+    for m in re.finditer(r'<form[^>]+action=["\']([^"\']*)["\']', content, re.IGNORECASE):
+        if m.group(1) and m.group(1) != '#':
+            refs.append(f'form:{m.group(1)}')
+    for m in re.finditer(r'<link[^>]+href=["\']([^"\']+\.(?:css|js))["\']', content, re.IGNORECASE):
+        refs.append(f'link:{m.group(1)}')
+    if refs:
+        return '[refs: ' + ', '.join(refs[:10]) + ']'
+    return ''
+
+
 def _compress_old(messages: list[dict]) -> list[dict]:
     """Compress old messages. Tool results get truncated heavily.
     Assistant messages keep tool_calls but lose verbose thinking."""
@@ -115,7 +131,13 @@ def _compress_old(messages: list[dict]) -> list[dict]:
         if role == 'tool':
             content = cmsg.get('content', '')
             if len(content) > OLD_RESULT_CAP:
-                cmsg['content'] = content[:OLD_RESULT_CAP] + f"\n[... {len(content)} chars total]"
+                # Preserve HTML asset references before truncating
+                preserved = _extract_key_refs(content)
+                if preserved:
+                    remaining_budget = max(100, OLD_RESULT_CAP - len(preserved) - 20)
+                    cmsg['content'] = f"{preserved}\n{content[:remaining_budget]}\n[... {len(content)} chars total]"
+                else:
+                    cmsg['content'] = content[:OLD_RESULT_CAP] + f"\n[... {len(content)} chars total]"
             compressed.append(cmsg)
 
         elif role == 'assistant':

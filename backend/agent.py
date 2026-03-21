@@ -266,6 +266,10 @@ class Agent:
         self._phase_failure_count: int = 0
         self._reflection_injected_at: int = -99
         self._current_strategy: str = ''
+        # Consecutive wasted iteration tracker (blocked/warned/cached/no-op tool calls)
+        self._consecutive_waste: int = 0
+        # Same-file repetition tracker: "/tmp/filename" -> count of commands with empty results
+        self._file_analysis_count: dict[str, int] = {}
         # Iteration counter for context windowing
         self._iteration_counter: int = 0
         # Shell session tracking
@@ -574,6 +578,85 @@ class Agent:
             except Exception:
                 pass
 
+    # ── Auto web asset extraction ────────────────────────────────
+
+    def _auto_extract_web_assets(self, result: str):
+        """Extract web asset references from HTML/JS tool output into state."""
+        L = self.logger
+        added = 0
+
+        # Script tags: <script src="...">
+        for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', result, re.IGNORECASE):
+            if self.state.add_web_asset('scripts', m.group(1)):
+                added += 1
+
+        # Link tags (CSS/JS): <link ... href="...">
+        for m in re.finditer(r'<link[^>]+href=["\']([^"\']+)["\']', result, re.IGNORECASE):
+            href = m.group(1)
+            if href.endswith(('.css', '.js')):
+                cat = 'stylesheets' if href.endswith('.css') else 'scripts'
+                if self.state.add_web_asset(cat, href):
+                    added += 1
+
+        # Form actions: <form ... action="...">
+        for m in re.finditer(r'<form[^>]+action=["\']([^"\']*)["\']', result, re.IGNORECASE):
+            action = m.group(1)
+            if action and action != '#':
+                if self.state.add_web_asset('forms', action):
+                    added += 1
+
+        # API endpoints in JS/HTML: paths like /api/...
+        for m in re.finditer(r'["\'](/api/[^"\'?\s]{3,})["\']', result):
+            if self.state.add_web_asset('api_endpoints', m.group(1)):
+                added += 1
+
+        # fetch/ajax/post/get URL patterns
+        for m in re.finditer(r'(?:fetch|ajax|post|get|put|delete)\s*\(\s*["\'](/[^"\'?\s]{3,})["\']', result, re.IGNORECASE):
+            if self.state.add_web_asset('api_endpoints', m.group(1)):
+                added += 1
+
+        if added:
+            L.log(f"{C_CYAN}Auto-extracted {added} web asset(s) into state{C_RESET}")
+
+    # ── IDOR pattern detection ──────────────────────────────────
+
+    def _check_idor_pattern(self, url: str, result: str):
+        """Detect numeric ID patterns in URLs and suggest trying other IDs (especially 0)."""
+        L = self.logger
+        # Match URLs like /data/1, /download/2, /user/3, /api/items/5, etc.
+        m = re.search(r'(https?://[^/]+)?(/[^?#\s]*?/)(\d+)(?:[?#\s]|$)', url)
+        if not m:
+            return
+        base_path = m.group(2)
+        current_id = int(m.group(3))
+
+        # Only fire once per base path
+        idor_key = f"_idor_nudge_{base_path}"
+        if hasattr(self, idor_key):
+            return
+        setattr(self, idor_key, True)
+
+        # Build suggestion list: always try 0, and try adjacent IDs
+        try_ids = set()
+        if current_id != 0:
+            try_ids.add(0)
+        if current_id > 1:
+            try_ids.add(current_id - 1)
+        try_ids.add(current_id + 1)
+        try_ids.discard(current_id)
+
+        if try_ids:
+            id_suggestions = ', '.join(str(i) for i in sorted(try_ids))
+            host_prefix = m.group(1) or ''
+            nudge = (
+                f"[SYSTEM] The URL {url} contains a numeric ID ({current_id}). "
+                f"This is a potential IDOR (Insecure Direct Object Reference). "
+                f"Try accessing other IDs — especially: {', '.join(f'{host_prefix}{base_path}{i}' for i in sorted(try_ids))}. "
+                f"ID 0 often contains pre-existing data (captures, profiles, records) from other users."
+            )
+            self.messages.append({'role': 'user', 'content': nudge})
+            L.log(f"{C_CYAN}IDOR pattern detected: {base_path}{current_id} → suggesting IDs: {id_suggestions}{C_RESET}")
+
     # ── Budget broadcasting ──────────────────────────────────────
 
     async def _broadcast_budget(self):
@@ -643,6 +726,16 @@ class Agent:
                     has_creds = bool(self.state.credentials)
                     if not has_access and not has_creds:
                         L.log(f"{C_RED}Hard stagnation: {self.phase} for {iters_in_phase} iters without access/creds — completing{C_RESET}")
+                        self.phase = 'complete'
+                        self._done = True
+                        break
+
+                # Hard stagnation: enumeration spinning without progress → force transition
+                if iters_in_phase > 25 and self.phase == 'enumeration' and new_nodes == 0:
+                    has_creds = bool(self.state.credentials)
+                    has_access = bool(self.state.accesses)
+                    if not has_creds and not has_access:
+                        L.log(f"{C_RED}Hard stagnation: enumeration for {iters_in_phase} iters with 0 new nodes — completing{C_RESET}")
                         self.phase = 'complete'
                         self._done = True
                         break
@@ -825,6 +918,53 @@ class Agent:
                     else:
                         self._tool_failures.pop(name, None)
 
+                    # ── Waste tracking ────────────────────────────
+                    _is_waste = (
+                        result.startswith('[ERROR]') or
+                        result.startswith('[WARNING]') or
+                        result.startswith('[CACHED') or
+                        (name == 'execute_command' and len(result.strip()) == 0)
+                    )
+                    if _is_waste:
+                        self._consecutive_waste += 1
+                        if self._consecutive_waste >= 5:
+                            waste_nudge = (
+                                "[SYSTEM] You have wasted the last 5+ tool calls on blocked/cached/useless commands. "
+                                "STOP using execute_command for local tasks. Instead:\n"
+                                "- Use curl_request to interact with the target web app\n"
+                                "- Use ffuf_fuzz to discover new endpoints or parameters\n"
+                                "- Use gobuster_dir for directory brute-forcing\n"
+                                "- Use nmap_scan with different flags (e.g. -p- for all ports, or UDP scan)\n"
+                                "- Use query_kb to look up exploits for discovered services\n"
+                                "- Check the 'Discovered Web Assets' section for JS/CSS files to fetch\n"
+                                "- Call transition_phase if you have exhausted this phase\n"
+                                "Your next call MUST use a dedicated tool, NOT execute_command."
+                            )
+                            self.messages.append({'role': 'user', 'content': waste_nudge})
+                            self._consecutive_waste = 0
+                            L.log(f"{C_RED}Waste detector: 5+ consecutive wasted calls — injecting corrective prompt{C_RESET}")
+                    else:
+                        self._consecutive_waste = 0
+
+                    # ── Same-file repetition detection ────────────
+                    if name == 'execute_command' and len(result.strip()) < 50:
+                        cmd_str = args.get('command', '')
+                        tmp_files = re.findall(r'/tmp/\S+', cmd_str)
+                        for tf in tmp_files:
+                            tf_clean = tf.rstrip("'\"`;|&)")
+                            self._file_analysis_count[tf_clean] = self._file_analysis_count.get(tf_clean, 0) + 1
+                            if self._file_analysis_count[tf_clean] >= 3:
+                                repetition_nudge = (
+                                    f"[SYSTEM] You have analyzed '{tf_clean}' {self._file_analysis_count[tf_clean]} times "
+                                    f"with no useful results. This file does NOT contain what you're looking for.\n"
+                                    f"- Check the 'Discovered Web Assets' section — there may be OTHER JS/CSS files to fetch\n"
+                                    f"- Use curl_request to fetch a different resource from the target\n"
+                                    f"- Use ffuf_fuzz to discover new endpoints"
+                                )
+                                self.messages.append({'role': 'user', 'content': repetition_nudge})
+                                L.log(f"{C_RED}Repetition detector: {tf_clean} analyzed {self._file_analysis_count[tf_clean]}x with empty results{C_RESET}")
+                                break
+
                     # ── Auto-update graph ────────────────────────
                     parsed = None
                     if name in TOOL_PARSERS and not result.startswith('[ERROR]') and not result.startswith('[TIMEOUT'):
@@ -844,6 +984,16 @@ class Agent:
                     # ── Auto-detect and add hostnames to /etc/hosts ──
                     if name in ('nmap_scan', 'curl_request', 'execute_command') and not result.startswith('[ERROR]'):
                         await self._auto_add_hosts(result)
+
+                    # ── Auto-extract web assets from HTML/JS output ──
+                    if name in ('curl_request', 'execute_command', 'download_and_analyze') and not result.startswith('[ERROR]'):
+                        self._auto_extract_web_assets(result)
+
+                    # ── IDOR pattern detection for numeric URL IDs ──
+                    if name in ('curl_request', 'download_and_analyze') and not result.startswith('[ERROR]'):
+                        url_arg = args.get('url', '')
+                        if url_arg:
+                            self._check_idor_pattern(url_arg, result)
 
                     # ── Check for new shell access ───────────────
                     await self._check_new_access()
