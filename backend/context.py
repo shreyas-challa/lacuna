@@ -10,6 +10,7 @@ Strategy:
   - Old iterations: compress tool results to 400 chars
   - The StateManager holds all actionable data, so old tool output is reference only
   - First user message always kept (engagement start)
+  - Final pass ensures tool results follow their tool calls (MiniMax strict ordering)
 """
 
 from __future__ import annotations
@@ -85,7 +86,55 @@ def build_messages(
         for msg in recent:
             messages.append(_cap_recent(msg))
 
-    return messages
+    return _enforce_tool_call_ordering(messages)
+
+
+def _enforce_tool_call_ordering(messages: list[dict]) -> list[dict]:
+    """Ensure tool result messages directly follow their assistant+tool_calls message.
+
+    Some LLM backends (MiniMax) require strict ordering: after an assistant message
+    with tool_calls, the next messages MUST be the corresponding tool results.
+    System nudges (role=user) injected between tool_calls and results will cause
+    a 400 error. This function reorders to fix that.
+    """
+    result = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+
+        # If this is an assistant message with tool_calls, collect its tool results
+        if (msg.get('role') == 'assistant' and msg.get('tool_calls')):
+            result.append(msg)
+            i += 1
+
+            # Gather the expected tool_call IDs
+            expected_ids = {tc['id'] for tc in msg['tool_calls']}
+            collected_tool_results = []
+            deferred_others = []
+
+            # Scan forward to find all matching tool results, deferring non-tool messages
+            while i < len(messages) and expected_ids:
+                next_msg = messages[i]
+                if next_msg.get('role') == 'tool' and next_msg.get('tool_call_id') in expected_ids:
+                    collected_tool_results.append(next_msg)
+                    expected_ids.discard(next_msg['tool_call_id'])
+                    i += 1
+                elif next_msg.get('role') == 'user':
+                    # User/system nudge injected mid-stream — defer it
+                    deferred_others.append(next_msg)
+                    i += 1
+                else:
+                    # Different assistant msg or unrelated tool — stop scanning
+                    break
+
+            # Emit tool results first (strict ordering), then deferred messages
+            result.extend(collected_tool_results)
+            result.extend(deferred_others)
+        else:
+            result.append(msg)
+            i += 1
+
+    return result
 
 
 def _cap_recent(msg: dict) -> dict:
