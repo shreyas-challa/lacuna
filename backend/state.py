@@ -58,6 +58,33 @@ class StateManager:
     LLM prompt, so the model never loses track of discoveries.
     """
 
+    # Generic libraries to skip when tracking web assets — these are never security-relevant
+    _SKIP_ASSETS = {
+        # JS frameworks & UI libraries
+        'jquery', 'bootstrap', 'popper', 'modernizr', 'angular', 'react', 'vue',
+        'backbone', 'ember', 'lodash', 'underscore', 'moment', 'handlebars',
+        # CSS/icon libraries
+        'font-awesome', 'fontawesome', 'material-icons', 'ionicons', 'glyphicons',
+        # Navigation/menu plugins
+        'metismenu', 'metis-menu', 'slimscroll', 'nicescroll', 'perfect-scrollbar',
+        # Carousel/slider plugins
+        'owl.carousel', 'owl-carousel', 'slick', 'swiper', 'flexslider', 'lightbox',
+        # Chart/visualization libraries
+        'chart.js', 'chartjs', 'd3.js', 'highcharts', 'morris', 'raphael', 'flot',
+        'line-chart', 'pie-chart', 'bar-chart', 'sparkline', 'peity', 'knob',
+        # Animation/effects
+        'animate', 'wow.js', 'wow.min', 'waypoint', 'scrollreveal', 'aos',
+        # Polyfills/utilities
+        'html5shiv', 'respond', 'polyfill', 'pace', 'nprogress',
+        # Analytics/tracking
+        'google-analytics', 'gtag', 'analytics', 'hotjar', 'mixpanel',
+        # Form/validation
+        'validate', 'parsley', 'select2', 'chosen', 'datepicker', 'colorpicker',
+        # Misc common
+        'toastr', 'sweetalert', 'swal', 'notify', 'socket.io',
+    }
+    _MAX_ASSETS_PER_CATEGORY = 20
+
     def __init__(self):
         self.credentials: dict[str, Credential] = {}  # key -> Credential
         self.accesses: list[Access] = []
@@ -65,6 +92,12 @@ class StateManager:
         self.findings: list[Finding] = []
         self.loot: dict[str, str] = {}  # "user_flag" -> hash, "root_flag" -> hash
         self.notes: list[str] = []  # free-form observations
+        self.web_assets: dict[str, set[str]] = {
+            'scripts': set(),        # JS files found in HTML
+            'stylesheets': set(),    # CSS files
+            'forms': set(),          # form action URLs
+            'api_endpoints': set(),  # /api/v1/... paths from JS/HTML
+        }
 
     # ── Credentials ──────────────────────────────────────────────
 
@@ -165,6 +198,30 @@ class StateManager:
         """Store flags, hashes, or other extracted values."""
         self.loot[name] = value
 
+    # ── Web Assets ────────────────────────────────────────────────
+
+    def add_web_asset(self, category: str, url: str) -> bool:
+        """Add a discovered web asset. Returns True if newly added."""
+        if category not in self.web_assets:
+            return False
+        url_clean = url.split('?')[0].strip()
+        if not url_clean or url_clean == '#':
+            return False
+        # Skip generic third-party libraries
+        basename = url_clean.rsplit('/', 1)[-1].lower()
+        if any(skip in basename for skip in self._SKIP_ASSETS):
+            return False
+        # Skip full external URLs (CDNs, etc.)
+        if url_clean.startswith('http') and '://' in url_clean:
+            return False
+        # Cap per category
+        if len(self.web_assets[category]) >= self._MAX_ASSETS_PER_CATEGORY:
+            return False
+        if url_clean in self.web_assets[category]:
+            return False
+        self.web_assets[category].add(url_clean)
+        return True
+
     # ── Prompt Generation ────────────────────────────────────────
 
     def get_prompt_summary(self) -> str:
@@ -211,6 +268,16 @@ class StateManager:
                 ver = f" ({svc.version})" if svc.version else ""
                 info = f" — {svc.info}" if svc.info else ""
                 lines.append(f"  - {svc.host}:{svc.port}/{svc.protocol} {svc.name}{ver}{info}")
+            sections.append('\n'.join(lines))
+
+        # Web Assets
+        all_assets = sum(len(v) for v in self.web_assets.values())
+        if all_assets:
+            lines = ["## Discovered Web Assets"]
+            for cat, items in self.web_assets.items():
+                if items:
+                    lines.append(f"  **{cat}**: {', '.join(sorted(items))}")
+            lines.append("  *Fetch unfamiliar files with curl_request or download_and_analyze.*")
             sections.append('\n'.join(lines))
 
         # Loot
