@@ -69,6 +69,7 @@ _NO_CACHE = frozenset({
     'transition_phase', 'append_report', 'update_graph',
     'msfconsole_run', 'send_payload', 'setup_listener',
     'run_linpeas', 'check_sudo', 'check_suid', 'check_cron', 'check_capabilities',
+    'web_request',
 })
 
 # ── Meta tools (always available) ───────────────────────────────
@@ -173,6 +174,8 @@ def normalize_args(name: str, args: dict) -> dict:
     normalized = {}
     for key, value in args.items():
         canonical = ARG_ALIASES.get(key, key)
+        if name == 'decode_text' and canonical == 'markdown':
+            canonical = 'text'
         normalized[canonical] = value
     if name == 'append_report' and 'title' in args:
         title = args.get('title', '')
@@ -233,6 +236,16 @@ def _add_tool_hint(name: str, args: dict, error_msg: str) -> str:
     if 'TIMEOUT' in error_msg:
         hint = f'HINT: Command timed out. Try a faster/lighter variant or reduce scope. {hint.replace("HINT: ", "Also: ")}'
     return f"{error_msg} {hint}"
+
+
+def _should_cache_tool(name: str, args: dict) -> bool:
+    if name in _NO_CACHE:
+        return False
+    if name == 'curl_request':
+        flags = f" {str(args.get('flags', '') or '')} "
+        if any(token in flags for token in (' -b ', ' --cookie ', ' -c ', ' --cookie-jar ', ' -o ', ' --output ')):
+            return False
+    return True
 
 
 def _find_terminal() -> str | None:
@@ -587,6 +600,14 @@ class Agent:
                     "[ERROR] Dominant workflow pending: this curl command is unrelated to the active invite/login path. "
                     f"Next step:\n{self._get_workflow_hint()}"
                 )
+        return None
+
+    def _guard_phase_transition(self, name: str, args: dict) -> str | None:
+        if name != 'transition_phase':
+            return None
+        next_phase = str(args.get('next_phase', '') or '').strip()
+        if next_phase == 'privesc' and not any(a.host == self.target for a in self.state.accesses):
+            return '[ERROR] Cannot transition to privesc without shell access on the target.'
         return None
 
     def _guard_execute_command(self, args: dict) -> str | None:
@@ -1186,6 +1207,7 @@ class Agent:
                     if sanitize_note:
                         L.log(f"{C_YELLOW}Args sanitized for {name}: {sanitize_note}{C_RESET}")
                     drift_error = self._guard_workflow_drift(name, args)
+                    transition_error = self._guard_phase_transition(name, args)
 
                     call_id = tc.id
                     args_short = json.dumps(args)
@@ -1196,7 +1218,7 @@ class Agent:
 
                     # ── Cache check ──────────────────────────────
                     cache_key = f"{name}|{json.dumps(args, sort_keys=True)}"
-                    if cache_key in self._tool_cache:
+                    if _should_cache_tool(name, args) and cache_key in self._tool_cache:
                         result = f"[CACHED - identical call already executed] {self._tool_cache[cache_key][:3000]}"
                         tool_time = 0.0
                         L.log(f"{C_YELLOW}Cache hit: {name}{C_RESET}")
@@ -1209,6 +1231,8 @@ class Agent:
                         # ── curl redirect check ──────────────
                         if drift_error:
                             result = drift_error
+                        elif transition_error:
+                            result = transition_error
                         elif name == 'execute_command':
                             guard_error = self._guard_execute_command(args)
                             if guard_error:
@@ -1235,7 +1259,7 @@ class Agent:
                         else:
                             result = await self._execute_tool(name, args)
                         tool_time = time.time() - tool_start
-                        if name not in _NO_CACHE:
+                        if _should_cache_tool(name, args):
                             self._tool_cache[cache_key] = result
 
                     # Prepend sanitization note so the model sees it
@@ -1350,7 +1374,7 @@ class Agent:
                     })
 
                     # ── Phase transition ─────────────────────────
-                    if name == 'transition_phase':
+                    if name == 'transition_phase' and not result.startswith('[ERROR]'):
                         next_phase = args.get('next_phase', '')
                         if not next_phase or next_phase not in PHASES + ['complete']:
                             current_idx = PHASES.index(self.phase) if self.phase in PHASES else -1
