@@ -430,18 +430,27 @@ class Agent:
         # Invite-driven footholds like 2million
         api_endpoints = self.state.web_assets.get('api_endpoints', set())
         notes = '\n'.join(self.state.notes)
+        markers = self.state.workflow_markers
         if self.phase == 'enumeration':
             if any('/api/v1/invite/how/to/generate' in ep for ep in api_endpoints):
                 suggestions.append(
                     "Invite flow detected — fetch /api/v1/invite/generate, decode returned text with decode_text, then POST the decoded code to /api/v1/invite/verify"
                 )
-            if 'invite_code' in self.state.loot:
+            if 'invite_code' in self.state.loot and not markers.get('invite_verified'):
                 suggestions.append(
-                    f"Decoded invite code available: {self.state.loot['invite_code']} — verify it, then register and log in"
+                    f"Decoded invite code available: {self.state.loot['invite_code']} — verify it now with web_request before doing anything broader"
                 )
             elif 'Invite code decoded:' in notes:
                 suggestions.append(
                     "Invite code decoded in Notes — use it with /api/v1/invite/verify before attempting registration"
+                )
+            if markers.get('invite_verified') and not markers.get('account_registered'):
+                suggestions.append(
+                    "Invite is verified — register a new account with web_request next."
+                )
+            if markers.get('account_registered') and not markers.get('authenticated_session'):
+                suggestions.append(
+                    "Account exists but no authenticated session is recorded — log in with web_request using the same session_name."
                 )
             if self.state.web_sessions:
                 suggestions.append(
@@ -486,11 +495,14 @@ class Agent:
                 "Respond with brief analysis plus exactly ONE low-cost, high-signal tool call. "
                 "Prefer dedicated tools over execute_command."
             )
+        workflow_hint = self._get_workflow_hint()
+        if workflow_hint:
+            base += f"\n\nCurrent dominant workflow:\n{workflow_hint}"
         return base
 
     def _inject_reflection_prompt(self, failures: int) -> str:
         """Force the agent to reflect after repeated failures."""
-        return (
+        msg = (
             f"[SYSTEM] You have had {failures} tool failures in the current phase. "
             f"Stop and reflect:\n"
             f"1. Why did these tools fail? What assumption is wrong?\n"
@@ -500,6 +512,82 @@ class Agent:
             f"Do not repeat the same tool with the same scope. "
             f"If in privesc, complete check_sudo/check_capabilities/check_suid/check_cron before exploit attempts."
         )
+        workflow_hint = self._get_workflow_hint()
+        if workflow_hint:
+            msg += f"\n\nDo not drift away from the active workflow until it is confirmed or falsified:\n{workflow_hint}"
+        return msg
+
+    def _get_workflow_hint(self) -> str:
+        invite_hypothesis = self.state.hypotheses.get('invite_workflow')
+        if not invite_hypothesis or invite_hypothesis.status not in ('active', 'validated'):
+            return ''
+
+        markers = self.state.workflow_markers
+        invite_code = self.state.loot.get('invite_code', '')
+        if not markers.get('invite_code_obtained'):
+            return (
+                "- Hypothesis: invite workflow gates access.\n"
+                "- Goal: obtain an invite code from the discovered invite endpoints.\n"
+                "- Success condition: invite_code_obtained marker becomes true."
+            )
+        if not markers.get('invite_verified'):
+            return (
+                "- Hypothesis: invite verification is the blocking step.\n"
+                f"- Known artifact: invite code {invite_code}\n"
+                "- Goal: POST the code to /api/v1/invite/verify with web_request.\n"
+                "- Success condition: invite_verified marker becomes true."
+            )
+        if not markers.get('account_registered'):
+            return (
+                "- Hypothesis: account creation is now the blocking step.\n"
+                "- Goal: POST a registration request with web_request.\n"
+                "- Success condition: account_registered marker becomes true."
+            )
+        if not markers.get('authenticated_session'):
+            return (
+                "- Hypothesis: login/session creation is now the blocking step.\n"
+                "- Goal: POST credentials to /api/v1/user/login with the same session_name.\n"
+                "- Success condition: authenticated_session marker becomes true."
+            )
+        return (
+            "- Invite workflow is complete. Use the authenticated session to continue deeper application enumeration."
+        )
+
+    def _guard_workflow_drift(self, name: str, args: dict) -> str | None:
+        """Block broad scanning when a finite web workflow is already dominant."""
+        invite_hypothesis = self.state.hypotheses.get('invite_workflow')
+        if not invite_hypothesis or invite_hypothesis.status not in ('active', 'validated'):
+            return None
+        if self.state.workflow_markers.get('authenticated_session'):
+            return None
+
+        noisy_tools = {'hydra_brute', 'gobuster_dir', 'ffuf_fuzz', 'nuclei_scan', 'nikto_scan', 'sqlmap_scan'}
+        if name in noisy_tools:
+            return (
+                "[ERROR] Dominant workflow pending: complete the invite/login workflow before broad scanning or brute force. "
+                f"Next step:\n{self._get_workflow_hint()}"
+            )
+
+        if name == 'execute_command':
+            command = str(args.get('command', '') or '')
+            if 'curl' not in command:
+                return (
+                    "[ERROR] Dominant workflow pending: use web_request/curl_request for the active invite/login workflow "
+                    "before unrelated shell actions."
+                )
+            workflow_paths = (
+                '/invite',
+                '/api/v1/invite/',
+                '/api/v1/user/register',
+                '/api/v1/user/login',
+                'inviteapi.min.js',
+            )
+            if not any(path in command for path in workflow_paths):
+                return (
+                    "[ERROR] Dominant workflow pending: this curl command is unrelated to the active invite/login path. "
+                    f"Next step:\n{self._get_workflow_hint()}"
+                )
+        return None
 
     def _guard_execute_command(self, args: dict) -> str | None:
         """Block unsafe or low-signal execute_command patterns before tool execution."""
@@ -1097,6 +1185,7 @@ class Agent:
                     args, sanitize_note = sanitize_tool_args(name, args, context=_sanitize_ctx)
                     if sanitize_note:
                         L.log(f"{C_YELLOW}Args sanitized for {name}: {sanitize_note}{C_RESET}")
+                    drift_error = self._guard_workflow_drift(name, args)
 
                     call_id = tc.id
                     args_short = json.dumps(args)
@@ -1118,7 +1207,9 @@ class Agent:
                         await self._broadcast_budget()
                         tool_start = time.time()
                         # ── curl redirect check ──────────────
-                        if name == 'execute_command':
+                        if drift_error:
+                            result = drift_error
+                        elif name == 'execute_command':
                             guard_error = self._guard_execute_command(args)
                             if guard_error:
                                 result = guard_error

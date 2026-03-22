@@ -334,6 +334,10 @@ def _extract_web_workflow_artifacts(output: str, target: str, state: StateManage
         if redirect:
             state.add_note(f'Session redirect: {redirect.group(1)}')
 
+    lower_output = output.lower()
+    if 'invite code decoded:' in lower_output or 'invite_code' in lower_output:
+        state.set_workflow_marker('invite_code_obtained')
+
     invite_paths = (
         '/invite',
         '/api/v1/invite/how/to/generate',
@@ -369,6 +373,7 @@ def _extract_web_workflow_artifacts(output: str, target: str, state: StateManage
             continue
         if _looks_like_invite_code(decoded):
             state.add_loot('invite_code', decoded)
+            state.set_workflow_marker('invite_code_obtained')
             state.add_note(f'Invite code decoded: {decoded}')
             state.add_note(f'Next step: POST code={decoded} to /api/v1/invite/verify')
             state.upsert_hypothesis(
@@ -386,6 +391,21 @@ def _extract_web_workflow_artifacts(output: str, target: str, state: StateManage
         if '/api/v1/invite/generate' in decoded and decoded != text:
             state.add_note(f'Decoded ROT13 hint: {decoded}')
 
+    current_url = last_url.group(1) if last_url else ''
+    status_code = int(status.group(1)) if status else 0
+    if current_url.endswith('/api/v1/invite/verify') and status_code in (200, 201):
+        if '"status":"success"' in lower_output or 'invite is valid' in lower_output or '"success":true' in lower_output:
+            state.set_workflow_marker('invite_verified')
+            state.add_note('Invite verification succeeded.')
+    if current_url.endswith('/api/v1/user/register') and status_code in (200, 201):
+        if '"status":"success"' in lower_output or 'registration successful' in lower_output or '"success":true' in lower_output:
+            state.set_workflow_marker('account_registered')
+            state.add_note('Account registration succeeded.')
+    if current_url.endswith('/api/v1/user/login') and status_code in (200, 201, 302):
+        if '"status":"success"' in lower_output or 'login successful' in lower_output or redirect or cookie_line:
+            state.set_workflow_marker('authenticated_session')
+            state.add_note('Authenticated web session established.')
+
 
 def _extract_from_json_payload(payload: object, state: StateManager):
     if isinstance(payload, dict):
@@ -396,6 +416,7 @@ def _extract_from_json_payload(payload: object, state: StateManager):
                 if key_lower in {'data', 'code', 'invite', 'invitecode'} and decoded and _looks_like_invite_code(decoded):
                     state.add_loot('invite_code', decoded)
                     state.add_loot('invite_code_b64', value)
+                    state.set_workflow_marker('invite_code_obtained')
                     state.add_note(f'Invite code decoded: {decoded}')
                     state.add_note('Verify the invite, then register and log in.')
                 elif 'how/to/generate' in value or '/api/v1/invite/' in value:
