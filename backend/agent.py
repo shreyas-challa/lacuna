@@ -67,7 +67,7 @@ ARG_ALIASES = {
 _NO_CACHE = frozenset({
     'transition_phase', 'append_report', 'update_graph',
     'msfconsole_run', 'send_payload', 'setup_listener',
-    'run_linpeas', 'check_sudo', 'check_suid', 'check_cron',
+    'run_linpeas', 'check_sudo', 'check_suid', 'check_cron', 'check_capabilities',
 })
 
 # ── Meta tools (always available) ───────────────────────────────
@@ -129,6 +129,7 @@ TOOL_HINTS = {
     'check_sudo': 'HINT: You MUST provide a full sshpass SSH command. Use: sshpass -p \'PASS\' ssh -o StrictHostKeyChecking=no USER@TARGET \'sudo -l\'',
     'check_suid': 'HINT: You MUST provide a full sshpass SSH command to run this remotely on the target.',
     'check_cron': 'HINT: You MUST provide a full sshpass SSH command to run this remotely on the target.',
+    'check_capabilities': 'HINT: You MUST provide a full sshpass SSH command. Use: sshpass -p \'PASS\' ssh -o StrictHostKeyChecking=no USER@TARGET \'getcap -r / 2>/dev/null\'',
     'sqlmap_scan': 'HINT: Ensure the target URL has a parameter to test (e.g. ?id=1). Try with --level=3 --risk=2 for deeper testing.',
     'hydra_brute': 'HINT: Verify the service is running and accessible. Try fewer credentials or a different protocol.',
     'wpscan': 'HINT: Ensure the target is running WordPress. Check the URL (usually /wp-login.php exists).',
@@ -178,6 +179,50 @@ def normalize_args(name: str, args: dict) -> dict:
         elif title and not md:
             normalized['markdown'] = f"## {title}"
     return normalized
+
+
+def sanitize_tool_args(name: str, args: dict, context: dict | None = None) -> tuple[dict, str | None]:
+    sanitized = dict(args)
+    note = None
+
+    if name == 'nmap_scan':
+        flags = str(sanitized.get('flags', '') or '').strip()
+        # First nmap call of enumeration: rewrite -p- to fast targeted scan
+        if ('-p-' in flags
+                and context
+                and context.get('nmap_call_count', 99) == 0
+                and context.get('phase') == 'enumeration'):
+            flags = re.sub(r'-p-', '', flags).strip()
+            if '-sV' not in flags:
+                flags += ' -sV'
+            if '-sC' not in flags:
+                flags += ' -sC'
+            if '-T4' not in flags and '-T5' not in flags:
+                flags += ' -T4'
+            sanitized['flags'] = flags.strip()
+            note = 'REWRITTEN: First nmap used -p-; rewritten to fast scan. Request -p- again after reviewing results.'
+            return sanitized, note
+        if '-A' in flags and '-sV' not in flags and '-sC' not in flags:
+            sanitized['flags'] = flags.replace('-A', '-sV -sC').strip()
+            note = 'Replaced -A with -sV -sC to avoid slow OS/scripts spray.'
+        flags = str(sanitized.get('flags', '') or '').strip()
+        if '-p-' in flags and '--host-timeout' not in flags:
+            sanitized['flags'] = f'{flags} --host-timeout 90s --max-retries 2 --min-rate 2000 -n'.strip()
+            note = 'Bounded full-port nmap scan to avoid 5-minute stalls.'
+
+    elif name == 'gobuster_dir':
+        flags = str(sanitized.get('flags', '') or '')
+        cleaned = flags.replace('-q', ' ').strip()
+        if cleaned != flags.strip():
+            sanitized['flags'] = cleaned
+            note = 'Removed redundant gobuster quiet flag; tool already adds it.'
+
+    elif name == 'execute_command':
+        command = str(sanitized.get('command', '') or '').strip()
+        if any(token in command for token in ('curl -s http', 'curl -sL http', 'curl -sv http')) and 'grep' in command:
+            note = 'Raw curl|grep pipeline detected; prefer curl_request or download_and_analyze unless target execution is required.'
+
+    return sanitized, note
 
 
 def _add_tool_hint(name: str, args: dict, error_msg: str) -> str:
@@ -254,6 +299,7 @@ class Agent:
         self._done = False
         self._tool_cache: dict[str, str] = {}
         self._tool_call_count = 0
+        self._nmap_call_count: int = 0
         self._phase_entry_iteration = 0
         self._phase_entry_node_count = 0
         self._last_nudge_iteration = -99
@@ -279,6 +325,8 @@ class Agent:
         self._prev_access_count: int = 0
         # Track hostnames added to /etc/hosts
         self._hosts_added: set = set()
+        # Privesc checklist completion tracker
+        self._privesc_checks_done: set[str] = set()
 
     # ── System prompt construction ───────────────────────────────
     def _build_system_prompt(self) -> str:
@@ -365,7 +413,7 @@ class Agent:
         has_root = self.state.has_root(self.target)
         if has_user and not has_root and self.phase == 'privesc':
             suggestions.append(
-                "User shell obtained — run check_sudo, check_suid, check_cron"
+                "User shell obtained — run check_sudo, check_capabilities, check_suid, check_cron IN THAT ORDER before attempting exploits"
             )
 
         # Credentials found but still in enumeration
@@ -390,15 +438,29 @@ class Agent:
 
     def _inject_planning_prompt(self) -> str:
         """Force the agent to strategize before acting in a new phase."""
-        return (
+        base = (
             f"[SYSTEM] You have entered the **{self.phase}** phase. Before taking any action, "
             f"analyze your current position:\n"
             f"1. What do you know so far? (services, credentials, access levels, vulnerabilities)\n"
             f"2. What is your hypothesis for the attack path?\n"
-            f"3. What are your next 3 specific actions, in priority order?\n\n"
-            f"Respond with your analysis ONLY — do NOT call any tools in this response. "
-            f"Execute your plan on the next turn."
+            f"3. What is the single highest-value next action?\n\n"
         )
+        if self.phase == 'privesc':
+            base += (
+                "MANDATORY PRIVESC CHECKLIST — execute IN ORDER before any exploit:\n"
+                "1. check_sudo (sudo -l)\n"
+                "2. check_capabilities (getcap -r / 2>/dev/null) — cap_setuid = instant root\n"
+                "3. check_suid (find / -perm -4000 -type f 2>/dev/null)\n"
+                "4. check_cron (cat /etc/crontab; ls -la /etc/cron.d/)\n"
+                "Do NOT attempt exploitation until ALL 4 checks are complete.\n"
+                "Start with check_sudo NOW."
+            )
+        else:
+            base += (
+                "Respond with brief analysis plus exactly ONE low-cost, high-signal tool call. "
+                "Prefer dedicated tools over execute_command."
+            )
+        return base
 
     def _inject_reflection_prompt(self, failures: int) -> str:
         """Force the agent to reflect after repeated failures."""
@@ -407,10 +469,47 @@ class Agent:
             f"Stop and reflect:\n"
             f"1. Why did these tools fail? What assumption is wrong?\n"
             f"2. What is a fundamentally different approach you haven't tried?\n"
-            f"3. Should you transition to a different phase instead?\n\n"
-            f"Respond with your analysis ONLY — do NOT call any tools in this response. "
-            f"Then take a different approach on the next turn."
+            f"3. What is the single best corrective action right now?\n\n"
+            f"Respond with brief reflection plus exactly ONE materially different tool call. "
+            f"Do not repeat the same tool with the same scope. "
+            f"If in privesc, complete check_sudo/check_capabilities/check_suid/check_cron before exploit attempts."
         )
+
+    def _guard_execute_command(self, args: dict) -> str | None:
+        """Block unsafe or low-signal execute_command patterns before tool execution."""
+        command = str(args.get('command', '') or '').lower()
+        if not command:
+            return None
+
+        if self.phase != 'privesc':
+            return None
+
+        checklist_patterns = (
+            'sudo -l',
+            'getcap -r /',
+            'find / -perm -4000',
+            '/etc/crontab',
+            '/etc/cron.d',
+        )
+        if any(p in command for p in checklist_patterns):
+            return (
+                "[ERROR] In privesc phase, checklist commands must use dedicated tools: "
+                "check_sudo, check_capabilities, check_suid, check_cron."
+            )
+
+        required = {'check_sudo', 'check_capabilities', 'check_suid', 'check_cron'}
+        if not required.issubset(self._privesc_checks_done):
+            exploit_markers = (
+                'pkexec', 'pwnkit', 'cve-2021-4034', '/tmp/exploit',
+                'msfconsole', 'os.setuid(0)', 'chmod u+s',
+            )
+            if any(marker in command for marker in exploit_markers):
+                missing = sorted(required - self._privesc_checks_done)
+                return (
+                    "[ERROR] Exploit attempt blocked: complete privesc checklist first. "
+                    f"Missing: {', '.join(missing)}."
+                )
+        return None
 
     def _is_planning_response(self) -> bool:
         """Check if the previous message was a [SYSTEM] planning/reflection prompt."""
@@ -935,6 +1034,11 @@ class Agent:
                     if args != raw_args:
                         L.log(f"{C_YELLOW}Args normalized: {json.dumps(raw_args)[:100]} -> {json.dumps(args)[:100]}{C_RESET}")
 
+                    _sanitize_ctx = {'phase': self.phase, 'nmap_call_count': self._nmap_call_count}
+                    args, sanitize_note = sanitize_tool_args(name, args, context=_sanitize_ctx)
+                    if sanitize_note:
+                        L.log(f"{C_YELLOW}Args sanitized for {name}: {sanitize_note}{C_RESET}")
+
                     call_id = tc.id
                     args_short = json.dumps(args)
                     if len(args_short) > 150:
@@ -950,12 +1054,35 @@ class Agent:
                         L.log(f"{C_YELLOW}Cache hit: {name}{C_RESET}")
                     else:
                         self._tool_call_count += 1
+                        if name == 'nmap_scan':
+                            self._nmap_call_count += 1
                         await self._broadcast_budget()
                         tool_start = time.time()
-                        result = await self._execute_tool(name, args)
+                        # ── curl redirect check ──────────────
+                        if name == 'execute_command':
+                            guard_error = self._guard_execute_command(args)
+                            if guard_error:
+                                result = guard_error
+                            else:
+                                redirect_tool, redirect_args, curl_feedback = self._check_curl_redirect(args)
+                                if redirect_tool:
+                                    L.log(f"{C_YELLOW}Redirecting execute_command(curl) → {redirect_tool}{C_RESET}")
+                                    result = await self._execute_tool(redirect_tool, redirect_args)
+                                    result = f"[REDIRECTED to {redirect_tool}] {result}"
+                                elif curl_feedback:
+                                    result = await self._execute_tool(name, args)
+                                    result = f"{result}\n\n{curl_feedback}"
+                                else:
+                                    result = await self._execute_tool(name, args)
+                        else:
+                            result = await self._execute_tool(name, args)
                         tool_time = time.time() - tool_start
                         if name not in _NO_CACHE:
                             self._tool_cache[cache_key] = result
+
+                    # Prepend sanitization note so the model sees it
+                    if sanitize_note:
+                        result = f"[NOTE: {sanitize_note}]\n\n{result}"
 
                     result_lines = result.count('\n') + 1
                     L.log(f"{C_GREEN}Done: {name} | {tool_time:.1f}s | {len(result)} chars, {result_lines} lines{C_RESET}")
@@ -968,6 +1095,8 @@ class Agent:
                             L.log(f"{C_RED}Circuit breaker: {name} failed {self._tool_failures[name]}x — temporarily disabled{C_RESET}")
                     else:
                         self._tool_failures.pop(name, None)
+                        if name in {'check_sudo', 'check_capabilities', 'check_suid', 'check_cron'}:
+                            self._privesc_checks_done.add(name)
 
                     # ── Waste tracking ────────────────────────────
                     _is_waste = (
@@ -989,7 +1118,7 @@ class Agent:
                                 "- Use query_kb to look up exploits for discovered services\n"
                                 "- Check the 'Discovered Web Assets' section for JS/CSS files to fetch\n"
                                 "- Call transition_phase if you have exhausted this phase\n"
-                                "Your next call MUST use a dedicated tool, NOT execute_command."
+                                "Prefer dedicated tools. In privesc, finish check_sudo/check_capabilities/check_suid/check_cron before exploit attempts."
                             )
                             self.messages.append({'role': 'user', 'content': waste_nudge, '_iteration': self._iteration_counter})
                             self._consecutive_waste = 0
@@ -1074,6 +1203,8 @@ class Agent:
                             self._done = True
                         elif next_phase in PHASES:
                             self.phase = next_phase
+                            if next_phase == 'privesc':
+                                self._privesc_checks_done.clear()
 
                         self._phase_entry_iteration = self.total_iterations
                         self._phase_entry_node_count = len(self.graph.nodes)
@@ -1118,6 +1249,36 @@ class Agent:
         await self.manager.broadcast('report_update', {'markdown': self.report.get_markdown()})
         await self.manager.broadcast('complete', {})
         L.close()
+
+    # ── curl redirect ────────────────────────────────────────────
+
+    def _check_curl_redirect(self, args: dict) -> tuple[str | None, dict | None, str | None]:
+        """Check if an execute_command(curl) should redirect to curl_request.
+
+        Returns (redirect_tool, redirect_args, feedback_note) or (None, None, None).
+        """
+        command = str(args.get('command', '') or '').strip()
+
+        # Never redirect curl inside sshpass/ssh/multi-command chains
+        if any(x in command for x in ('sshpass', 'ssh ', '&&', ';', 'python', 'bash -c', 'gcc', 'wget')):
+            return None, None, None
+
+        # Simple curl: curl [flags] URL — no pipe/redirect
+        m = re.match(r'^curl\s+((?:-[a-zA-Z]+\s+)*)(["\']?https?://\S+["\']?)\s*$', command)
+        if m:
+            flags = m.group(1).strip()
+            url = m.group(2).strip().strip("'\"")
+            return 'curl_request', {'url': url, 'flags': flags or '-sS'}, None
+
+        # curl|grep pipeline: allow but inject feedback
+        if re.match(r'^curl\s+.*\|\s*(grep|head|tail|awk|sed)', command):
+            return None, None, (
+                '[NOTE] You used execute_command for a curl pipeline. '
+                'Use curl_request for simple URL fetching — it is faster and auto-sanitized. '
+                'Reserve execute_command for complex pipelines or target-side execution via SSH.'
+            )
+
+        return None, None, None
 
     # ── Tool execution ───────────────────────────────────────────
 
