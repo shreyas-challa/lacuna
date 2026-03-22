@@ -393,6 +393,8 @@ def _extract_web_workflow_artifacts(output: str, target: str, state: StateManage
 
     current_url = last_url.group(1) if last_url else ''
     status_code = int(status.group(1)) if status else 0
+    body_match = re.search(r'Response Body:\n(.*)', output, re.DOTALL)
+    response_body = body_match.group(1).lower() if body_match else lower_output
     if current_url.endswith('/api/v1/invite/verify') and status_code in (200, 201):
         if '"status":"success"' in lower_output or 'invite is valid' in lower_output or '"success":true' in lower_output:
             state.set_workflow_marker('invite_verified')
@@ -405,6 +407,10 @@ def _extract_web_workflow_artifacts(output: str, target: str, state: StateManage
         if '"status":"success"' in lower_output or 'login successful' in lower_output or redirect or cookie_line:
             state.set_workflow_marker('authenticated_session')
             state.add_note('Authenticated web session established.')
+    if current_url.endswith('/home') and status_code == 200:
+        if 'login' not in response_body[:400] and 'forgot password' not in response_body:
+            state.set_workflow_marker('authenticated_session')
+            state.add_note('Authenticated dashboard access confirmed.')
 
 
 def _extract_from_json_payload(payload: object, state: StateManager):
