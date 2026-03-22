@@ -113,6 +113,7 @@ class StateManager:
         self.notes: list[str] = []  # free-form observations
         self.web_sessions: dict[str, WebSession] = {}
         self.hypotheses: dict[str, Hypothesis] = {}
+        self.workflow_markers: dict[str, bool] = {}
         self.web_assets: dict[str, set[str]] = {
             'scripts': set(),        # JS files found in HTML
             'stylesheets': set(),    # CSS files
@@ -224,6 +225,11 @@ class StateManager:
         note = (note or '').strip()
         if note and note not in self.notes:
             self.notes.append(note)
+
+    def set_workflow_marker(self, key: str, value: bool = True):
+        """Track completion of app-workflow milestones."""
+        if key:
+            self.workflow_markers[key] = value
 
     def upsert_web_session(self, name: str, **kwargs):
         """Create or update a web session summary."""
@@ -355,6 +361,13 @@ class StateManager:
                     f"cookies={cookies}, last_url={session.last_url or session.base_url or 'n/a'}"
                 )
             sections.append('\n'.join(lines))
+
+        if self.workflow_markers:
+            lines = ["## Workflow Markers"]
+            for key in sorted(k for k, v in self.workflow_markers.items() if v):
+                lines.append(f"  - {key}")
+            if len(lines) > 1:
+                sections.append('\n'.join(lines))
 
         # Loot
         if self.loot:
