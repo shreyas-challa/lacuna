@@ -1,4 +1,6 @@
 import os
+import re
+import ipaddress
 from backend.tools.base import tool, run_command
 from backend.knowledge import query_knowledge_base
 
@@ -39,6 +41,61 @@ def _find_wordlist(name: str = 'common') -> str | None:
 DEFAULT_WORDLIST = _find_wordlist('common') or '/usr/share/seclists/Discovery/Web-Content/common.txt'
 
 
+def _dedupe_flags(flags: str) -> str:
+    seen = []
+    for part in flags.split():
+        if part not in seen:
+            seen.append(part)
+    return ' '.join(seen)
+
+
+def _sanitize_nmap_flags(flags: str) -> str:
+    flags = re.sub(r'\s+', ' ', (flags or '').strip())
+    if not flags:
+        flags = '-sV -sC'
+
+    # Full-port scans are often worthwhile on HTB, but they should be bounded.
+    is_full_scan = '-p-' in flags or '--top-ports' in flags or '-A' in flags
+    if is_full_scan:
+        if '--host-timeout' not in flags:
+            flags += ' --host-timeout 90s'
+        if '--max-retries' not in flags:
+            flags += ' --max-retries 2'
+        if '--min-rate' not in flags:
+            flags += ' --min-rate 2000'
+        if '-n' not in flags:
+            flags += ' -n'
+
+    return _dedupe_flags(flags)
+
+
+def _sanitize_gobuster_flags(flags: str) -> str:
+    flags = re.sub(r'\s+', ' ', (flags or '').strip())
+    if '--timeout' not in flags:
+        flags += ' --timeout 5s'
+    if '-t ' not in f'{flags} ' and '--threads' not in flags:
+        flags += ' -t 20'
+    return _dedupe_flags(flags.strip())
+
+
+def _sanitize_ffuf_flags(flags: str) -> str:
+    flags = re.sub(r'\s+', ' ', (flags or '').strip())
+    if '-timeout' not in flags:
+        flags += ' -timeout 5'
+    if '-maxtime' not in flags:
+        flags += ' -maxtime 60'
+    return _dedupe_flags(flags.strip())
+
+
+def _sanitize_curl_flags(flags: str) -> str:
+    flags = re.sub(r'\s+', ' ', (flags or '').strip())
+    if not flags:
+        flags = '-sS'
+    if '--max-time' not in flags and '-m ' not in f'{flags} ':
+        flags += ' --max-time 20'
+    return flags.strip()
+
+
 @tool(
     name='nmap_scan',
     description='Run an nmap scan against a target. Supports custom flags.',
@@ -53,7 +110,9 @@ DEFAULT_WORDLIST = _find_wordlist('common') or '/usr/share/seclists/Discovery/We
     phases=['enumeration'],
 )
 async def nmap_scan(target: str, flags: str = '-sV -sC') -> str:
-    return await run_command(f'nmap {flags} {target}', timeout=300)
+    safe_flags = _sanitize_nmap_flags(flags)
+    timeout = 120 if '-p-' in safe_flags or '--top-ports' in safe_flags or '-A' in safe_flags else 60
+    return await run_command(f'nmap {safe_flags} {target}', timeout=timeout)
 
 
 @tool(
@@ -80,7 +139,8 @@ async def gobuster_dir(url: str, wordlist: str = '', flags: str = '') -> str:
     # If user didn't specify status codes, exclude 301 redirects to avoid wildcard noise
     if '-s ' not in flags and '--status-codes' not in flags:
         base_flags += ' -b 404'
-    result = await run_command(f'gobuster dir -u {url} -w {wl} {base_flags} {flags}', timeout=300)
+    safe_flags = _sanitize_gobuster_flags(flags)
+    result = await run_command(f'gobuster dir -u {url} -w {wl} {base_flags} {safe_flags}', timeout=90)
     # Detect gobuster wildcard/error abort
     if 'the server returns a status code that matches' in result or 'Wildcard response found' in result.lower():
         return (
@@ -114,7 +174,8 @@ async def ffuf_fuzz(url: str, wordlist: str = '', flags: str = '') -> str:
     auto_flags = '-c -noninteractive'
     if '-fc' not in flags and '-fs' not in flags and '-ac' not in flags:
         auto_flags += ' -ac'  # auto-calibrate: ffuf detects and filters wildcard sizes
-    return await run_command(f'ffuf -u {url} -w {wl} {auto_flags} {flags}', timeout=300)
+    safe_flags = _sanitize_ffuf_flags(flags)
+    return await run_command(f'ffuf -u {url} -w {wl} {auto_flags} {safe_flags}', timeout=90)
 
 
 @tool(
@@ -147,7 +208,8 @@ async def whatweb_scan(target: str) -> str:
     phases=['enumeration'],
 )
 async def curl_request(url: str, flags: str = '-s') -> str:
-    return await run_command(f'curl {flags} {url}', timeout=120)
+    safe_flags = _sanitize_curl_flags(flags)
+    return await run_command(f'curl {safe_flags} {url}', timeout=30)
 
 
 @tool(
@@ -275,7 +337,11 @@ async def download_and_analyze(url: str, filename: str) -> str:
     },
     phases=['enumeration'],
 )
-async def execute_command_enum(command: str) -> str:
+async def execute_command_enum(command: str, target: str) -> str:
+    return await _execute_command_guarded(command, target)
+
+
+async def _execute_command_guarded(command: str, target: str = '') -> str:
     cmd_stripped = command.strip()
 
     # Reject hallucinated non-commands
@@ -302,6 +368,15 @@ async def execute_command_enum(command: str) -> str:
     if cmd_lower.startswith('echo ') and '|' not in cmd_stripped and '>>' not in cmd_stripped and 'tee' not in cmd_lower:
         return "[ERROR] Do not echo status messages — call a tool that advances the engagement."
 
+    # Disallow external internet payload fetching inside execute_command.
+    # execute_command is for target interaction, not downloading random exploit PoCs locally.
+    for url_host in _extract_url_hosts(cmd_stripped):
+        if not _is_allowed_target_host(url_host, target):
+            return (
+                f"[ERROR] External URL '{url_host}' blocked in execute_command. "
+                "Only target/lab hosts are allowed here. Use query_kb or target-native checks instead."
+            )
+
     # Block purely local recon commands (not SSH'd to target)
     _LOCAL_ONLY = ('whoami', 'uname -a', 'uname', 'uptime', 'hostname', 'id',
                    'date', 'pwd', 'w', 'last', 'ps', 'ps aux', 'env')
@@ -324,6 +399,24 @@ async def execute_command_enum(command: str) -> str:
             "Use a dedicated tool: nmap_scan, curl_request, gobuster_dir, ffuf_fuzz, or query_kb."
         )
 
+    # execute_command must be target-context unless this is a read-only /tmp artifact inspection.
+    has_remote_context = (
+        'sshpass ' in cmd_lower
+        or _command_mentions_target_url(cmd_stripped, target)
+        or (' scp ' in f' {cmd_lower} ' and '@' in cmd_stripped)
+    )
+    if not has_remote_context:
+        if _looks_like_local_mutation(cmd_lower):
+            return (
+                "[ERROR] Local mutation/exec command blocked. "
+                "Run commands on the target via sshpass or use dedicated tools."
+            )
+        if not _is_safe_local_tmp_read(cmd_stripped):
+            return (
+                "[ERROR] execute_command requires target context (sshpass/target URL). "
+                "Only read-only inspection of /tmp artifacts is allowed locally."
+            )
+
     # Block find/locate on the local system (wordlist hunting etc.)
     if cmd_stripped.startswith('find /') and 'tmp/' not in cmd_stripped:
         return "[ERROR] Searching the local filesystem wastes iterations. Use dedicated tools with keyword wordlists (e.g. gobuster_dir with wordlist='common')."
@@ -338,6 +431,64 @@ async def execute_command_enum(command: str) -> str:
                     return f"[ERROR] Reading local project files wastes iterations. Focus on the target."
 
     return await run_command(command)
+
+
+_URL_RE = re.compile(r'https?://([^/\s\'":]+)')
+_SAFE_LOCAL_READ_PREFIXES = (
+    'file ', 'strings ', 'xxd ', 'hexdump ', 'stat ', 'wc ',
+    'head ', 'tail ', 'cat ', 'grep ', 'sed ', 'awk ',
+    'tshark ', 'tcpdump ',
+)
+_LOCAL_MUTATION_TOKENS = (
+    'gcc ', 'clang ', 'make ', 'cmake ', 'python ', 'python3 ', 'perl ', 'ruby ',
+    'bash ', 'sh ', './', 'chmod ', 'chown ', 'chgrp ', 'tee ', '>>', ' >', '<<',
+    'wget ', 'curl ', 'msfconsole', 'pkexec', 'pwnkit',
+)
+
+
+def _extract_url_hosts(command: str) -> list[str]:
+    hosts = []
+    for m in _URL_RE.finditer(command):
+        host = m.group(1).strip().lower()
+        if host:
+            hosts.append(host)
+    return hosts
+
+
+def _is_allowed_target_host(host: str, target: str) -> bool:
+    clean = host.split('@')[-1].split(':')[0].strip().lower()
+    target_clean = (target or '').strip().lower()
+    if target_clean and clean == target_clean:
+        return True
+    if clean.endswith('.htb'):
+        return True
+    try:
+        return ipaddress.ip_address(clean).is_private
+    except ValueError:
+        return False
+
+
+def _command_mentions_target_url(command: str, target: str) -> bool:
+    for host in _extract_url_hosts(command):
+        if _is_allowed_target_host(host, target):
+            return True
+    return False
+
+
+def _looks_like_local_mutation(cmd_lower: str) -> bool:
+    return any(tok in cmd_lower for tok in _LOCAL_MUTATION_TOKENS)
+
+
+def _is_safe_local_tmp_read(command: str) -> bool:
+    cmd = command.strip()
+    cmd_lower = cmd.lower()
+    if not cmd_lower.startswith(_SAFE_LOCAL_READ_PREFIXES):
+        return False
+    if '/tmp/' not in cmd and '/tmp ' not in cmd:
+        return False
+    if any(tok in cmd_lower for tok in (' >', '>>', '<<', 'chmod ', './', 'bash ', 'python ', 'python3 ')):
+        return False
+    return True
 
 
 @tool(
