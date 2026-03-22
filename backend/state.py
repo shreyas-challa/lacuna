@@ -51,6 +51,25 @@ class Finding:
     cve: str = ""
 
 
+@dataclass
+class WebSession:
+    name: str
+    base_url: str = ""
+    last_url: str = ""
+    last_status: int = 0
+    last_content_type: str = ""
+    authenticated: bool = False
+    cookies: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Hypothesis:
+    key: str
+    description: str
+    status: str = "active"  # active, validated, rejected
+    evidence: str = ""
+
+
 class StateManager:
     """The agent's structured working memory.
 
@@ -92,6 +111,8 @@ class StateManager:
         self.findings: list[Finding] = []
         self.loot: dict[str, str] = {}  # "user_flag" -> hash, "root_flag" -> hash
         self.notes: list[str] = []  # free-form observations
+        self.web_sessions: dict[str, WebSession] = {}
+        self.hypotheses: dict[str, Hypothesis] = {}
         self.web_assets: dict[str, set[str]] = {
             'scripts': set(),        # JS files found in HTML
             'stylesheets': set(),    # CSS files
@@ -198,6 +219,49 @@ class StateManager:
         """Store flags, hashes, or other extracted values."""
         self.loot[name] = value
 
+    def add_note(self, note: str):
+        """Store a short free-form observation once."""
+        note = (note or '').strip()
+        if note and note not in self.notes:
+            self.notes.append(note)
+
+    def upsert_web_session(self, name: str, **kwargs):
+        """Create or update a web session summary."""
+        if not name:
+            return
+        session = self.web_sessions.get(name)
+        if not session:
+            session = WebSession(name=name)
+            self.web_sessions[name] = session
+
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            if key == 'cookies' and value:
+                for cookie in value:
+                    if cookie and cookie not in session.cookies:
+                        session.cookies.append(cookie)
+            elif hasattr(session, key) and value != "":
+                setattr(session, key, value)
+
+    def upsert_hypothesis(self, key: str, description: str, status: str = "active", evidence: str = ""):
+        """Track the current dominant reasoning branches explicitly."""
+        if not key or not description:
+            return
+        existing = self.hypotheses.get(key)
+        if existing:
+            existing.description = description
+            existing.status = status or existing.status
+            if evidence:
+                existing.evidence = evidence
+            return
+        self.hypotheses[key] = Hypothesis(
+            key=key,
+            description=description,
+            status=status or "active",
+            evidence=evidence,
+        )
+
     # ── Web Assets ────────────────────────────────────────────────
 
     def add_web_asset(self, category: str, url: str) -> bool:
@@ -280,11 +344,39 @@ class StateManager:
             lines.append("  *Fetch unfamiliar files with curl_request or download_and_analyze.*")
             sections.append('\n'.join(lines))
 
+        # Web Sessions
+        if self.web_sessions:
+            lines = ["## Web Sessions"]
+            for session in self.web_sessions.values():
+                cookies = ', '.join(session.cookies[:6]) if session.cookies else 'none'
+                auth = 'yes' if session.authenticated else 'no'
+                lines.append(
+                    f"  - {session.name}: status={session.last_status or 'unknown'}, auth={auth}, "
+                    f"cookies={cookies}, last_url={session.last_url or session.base_url or 'n/a'}"
+                )
+            sections.append('\n'.join(lines))
+
         # Loot
         if self.loot:
             lines = ["## Loot"]
             for name, value in self.loot.items():
                 lines.append(f"  - {name}: {value}")
+            sections.append('\n'.join(lines))
+
+        # Notes
+        if self.notes:
+            lines = ["## Notes"]
+            for note in self.notes[:8]:
+                lines.append(f"  - {note}")
+            sections.append('\n'.join(lines))
+
+        # Hypotheses
+        active_hypotheses = [h for h in self.hypotheses.values() if h.status in ('active', 'validated')]
+        if active_hypotheses:
+            lines = ["## Hypotheses"]
+            for hyp in active_hypotheses[:6]:
+                evidence = f" — {hyp.evidence}" if hyp.evidence else ""
+                lines.append(f"  - [{hyp.status.upper()}] {hyp.description}{evidence}")
             sections.append('\n'.join(lines))
 
         # Findings
