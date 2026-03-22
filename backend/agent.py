@@ -12,6 +12,7 @@ Architecture:
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -117,8 +118,10 @@ TOOL_HINTS = {
     'ffuf_fuzz': 'HINT: Ensure the URL contains the FUZZ keyword. Check the target is responding. Try filtering by response size (-fs) or status code (-fc).',
     'whatweb_scan': 'HINT: Verify the target URL/IP is correct. Try using http:// or https:// explicitly.',
     'curl_request': 'HINT: Check the URL is well-formed and the service is up. Try adding -v for verbose output or -k to skip TLS verification.',
+    'web_request': 'HINT: Use this for stateful web forms, JSON APIs, and login/invite flows. Keep a stable session_name so cookies persist across steps.',
     'download_and_analyze': 'HINT: Verify the download URL is correct and the file exists. Check HTTP response code. Try curl_request first to confirm the URL works.',
     'execute_command': 'HINT: Check command syntax. If running remote commands via SSH, verify credentials and connectivity first.',
+    'decode_text': 'HINT: Use this for base64, ROT13, or URL-decoding invite codes, tokens, and obfuscated hints instead of shell commands.',
     'nuclei_scan': 'HINT: Ensure the target URL is correct. Try with specific templates (-t) instead of full scan. Check if nuclei templates are installed.',
     'searchsploit': 'HINT: Simplify the search query — use just the software name and version (e.g. "Apache 2.4.49"). Avoid special characters.',
     'nikto_scan': 'HINT: Verify the target URL is correct and the web server is responding. Try with -ssl flag if HTTPS.',
@@ -327,6 +330,8 @@ class Agent:
         self._hosts_added: set = set()
         # Privesc checklist completion tracker
         self._privesc_checks_done: set[str] = set()
+        # Persistent per-phase budgets; do not reset when the outer loop re-enters the same phase
+        self._phase_iterations_used: dict[str, int] = {phase: 0 for phase in PHASES}
 
     # ── System prompt construction ───────────────────────────────
     def _build_system_prompt(self) -> str:
@@ -421,6 +426,27 @@ class Agent:
             suggestions.append(
                 "Credentials discovered — consider transitioning to exploitation"
             )
+
+        # Invite-driven footholds like 2million
+        api_endpoints = self.state.web_assets.get('api_endpoints', set())
+        notes = '\n'.join(self.state.notes)
+        if self.phase == 'enumeration':
+            if any('/api/v1/invite/how/to/generate' in ep for ep in api_endpoints):
+                suggestions.append(
+                    "Invite flow detected — fetch /api/v1/invite/generate, decode returned text with decode_text, then POST the decoded code to /api/v1/invite/verify"
+                )
+            if 'invite_code' in self.state.loot:
+                suggestions.append(
+                    f"Decoded invite code available: {self.state.loot['invite_code']} — verify it, then register and log in"
+                )
+            elif 'Invite code decoded:' in notes:
+                suggestions.append(
+                    "Invite code decoded in Notes — use it with /api/v1/invite/verify before attempting registration"
+                )
+            if self.state.web_sessions:
+                suggestions.append(
+                    "Use web_request with a stable session_name for login, registration, invite verification, and JSON API calls so cookies persist."
+                )
 
         if suggestions:
             return "## Suggested Actions\n" + '\n'.join(f"- {s}" for s in suggestions[:4])
@@ -849,7 +875,39 @@ class Agent:
         self._phase_entry_node_count = len(self.graph.nodes)
 
         while self.phase != 'complete' and self.total_iterations < MAX_TOTAL_ITERATIONS and not self._done:
-            phase_iterations = 0
+            phase_iterations = self._phase_iterations_used.get(self.phase, 0)
+            if phase_iterations >= MAX_ITERATIONS_PER_PHASE:
+                await self._evaluate_strategy()
+                if self.phase == 'complete' or self._done:
+                    break
+                if self._phase_iterations_used.get(self.phase, 0) >= MAX_ITERATIONS_PER_PHASE:
+                    exhausted_phase = self.phase
+                    next_phase = 'complete'
+                    if exhausted_phase == 'enumeration':
+                        has_working_path = bool(
+                            self.state.credentials
+                            or self.state.accesses
+                            or self.state.findings
+                            or self.state.hypotheses
+                            or self.state.loot.get('invite_code')
+                        )
+                        next_phase = 'exploitation' if has_working_path else 'complete'
+                    elif exhausted_phase == 'exploitation':
+                        next_phase = 'privesc' if self.state.has_access(self.target) else 'complete'
+
+                    L.log(
+                        f"{C_YELLOW}Phase budget exhausted for {exhausted_phase} "
+                        f"({phase_iterations}/{MAX_ITERATIONS_PER_PHASE}) -> {next_phase}{C_RESET}"
+                    )
+                    self.phase = next_phase
+                    if next_phase == 'complete':
+                        self._done = True
+                        break
+                    self._phase_entry_iteration = self.total_iterations
+                    self._phase_entry_node_count = len(self.graph.nodes)
+                    await self.manager.broadcast('phase_change', {'phase': self.phase})
+                    await self._broadcast_budget()
+                    continue
             consecutive_stops = 0
             self._phase_failure_count = 0
 
@@ -864,6 +922,7 @@ class Agent:
                 self.total_iterations += 1
                 self._iteration_counter += 1
                 phase_iterations += 1
+                self._phase_iterations_used[self.phase] = phase_iterations
 
                 # ── Stagnation detection ─────────────────────────
                 iters_in_phase = self.total_iterations - self._phase_entry_iteration
@@ -1064,16 +1123,24 @@ class Agent:
                             if guard_error:
                                 result = guard_error
                             else:
-                                redirect_tool, redirect_args, curl_feedback = self._check_curl_redirect(args)
-                                if redirect_tool:
-                                    L.log(f"{C_YELLOW}Redirecting execute_command(curl) → {redirect_tool}{C_RESET}")
-                                    result = await self._execute_tool(redirect_tool, redirect_args)
-                                    result = f"[REDIRECTED to {redirect_tool}] {result}"
-                                elif curl_feedback:
-                                    result = await self._execute_tool(name, args)
-                                    result = f"{result}\n\n{curl_feedback}"
+                                web_tool, web_args, web_feedback = self._check_web_redirect(args)
+                                if web_tool:
+                                    L.log(f"{C_YELLOW}Redirecting execute_command(curl) -> {web_tool}{C_RESET}")
+                                    result = await self._execute_tool(web_tool, web_args)
+                                    result = f"[REDIRECTED to {web_tool}] {result}"
+                                    if web_feedback:
+                                        result = f"{web_feedback}\n\n{result}"
                                 else:
-                                    result = await self._execute_tool(name, args)
+                                    redirect_tool, redirect_args, curl_feedback = self._check_curl_redirect(args)
+                                    if redirect_tool:
+                                        L.log(f"{C_YELLOW}Redirecting execute_command(curl) -> {redirect_tool}{C_RESET}")
+                                        result = await self._execute_tool(redirect_tool, redirect_args)
+                                        result = f"[REDIRECTED to {redirect_tool}] {result}"
+                                    elif curl_feedback:
+                                        result = await self._execute_tool(name, args)
+                                        result = f"{result}\n\n{curl_feedback}"
+                                    else:
+                                        result = await self._execute_tool(name, args)
                         else:
                             result = await self._execute_tool(name, args)
                         tool_time = time.time() - tool_start
@@ -1251,6 +1318,89 @@ class Agent:
         L.close()
 
     # ── curl redirect ────────────────────────────────────────────
+
+    def _default_session_name_for_url(self, url: str) -> str:
+        host = re.sub(r'^https?://', '', url or '').split('/', 1)[0]
+        host = host or self.target
+        return re.sub(r'[^a-zA-Z0-9_.-]+', '_', host)
+
+    def _check_web_redirect(self, args: dict) -> tuple[str | None, dict | None, str | None]:
+        """Redirect stateful curl usage into web_request."""
+        command = str(args.get('command', '') or '').strip()
+        if not command.startswith('curl '):
+            return None, None, None
+        if any(x in command for x in ('|', '&&', ';', 'sshpass', 'ssh ', 'wget')):
+            return None, None, None
+
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return None, None, None
+
+        method = 'GET'
+        headers: list[str] = []
+        data = ''
+        json_body = ''
+        follow_redirects = False
+        url = ''
+        saw_stateful_flag = False
+
+        i = 1
+        while i < len(tokens):
+            token = tokens[i]
+            if token in ('-X', '--request') and i + 1 < len(tokens):
+                method = tokens[i + 1].upper()
+                saw_stateful_flag = True
+                i += 2
+                continue
+            if token in ('-H', '--header') and i + 1 < len(tokens):
+                header = tokens[i + 1]
+                headers.append(header)
+                saw_stateful_flag = True
+                i += 2
+                continue
+            if token in ('-d', '--data', '--data-raw', '--data-binary', '--form') and i + 1 < len(tokens):
+                payload = tokens[i + 1]
+                if any(h.lower().startswith('content-type: application/json') for h in headers):
+                    json_body = payload
+                else:
+                    data = payload
+                if method == 'GET':
+                    method = 'POST'
+                saw_stateful_flag = True
+                i += 2
+                continue
+            if token in ('-L', '--location'):
+                follow_redirects = True
+                saw_stateful_flag = True
+                i += 1
+                continue
+            if token in ('-b', '--cookie', '-c', '--cookie-jar'):
+                saw_stateful_flag = True
+                i += 2 if i + 1 < len(tokens) else 1
+                continue
+            if token.startswith('http://') or token.startswith('https://'):
+                url = token
+            i += 1
+
+        if not url:
+            return None, None, None
+        if not saw_stateful_flag and method == 'GET':
+            return None, None, None
+
+        return (
+            'web_request',
+            {
+                'url': url,
+                'method': method,
+                'session_name': self._default_session_name_for_url(url),
+                'headers': headers,
+                'data': data,
+                'json_body': json_body,
+                'follow_redirects': follow_redirects,
+            },
+            '[NOTE] Redirected stateful curl to web_request so cookies, redirects, headers, and body are preserved structurally.',
+        )
 
     def _check_curl_redirect(self, args: dict) -> tuple[str | None, dict | None, str | None]:
         """Check if an execute_command(curl) should redirect to curl_request.

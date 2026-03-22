@@ -4,3 +4,4 @@ from backend.tools.vuln_analysis import *
 from backend.tools.exploitation import *
 from backend.tools.privesc import *
 from backend.tools.web import *
+from backend.tools.web_session import *

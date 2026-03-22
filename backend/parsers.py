@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 import base64
+import codecs
+import json
 
 from backend.state import StateManager
 
@@ -303,8 +305,129 @@ def extract_state_from_command(output: str, target: str, state: StateManager):
                     severity='high', service=target,
                     description=f'{line.split("/")[-1]} has SUID bit set',
                 )
+
+        _extract_web_workflow_artifacts(output, target, state)
     except Exception:
         pass
+
+
+def _extract_web_workflow_artifacts(output: str, target: str, state: StateManager):
+    """Extract app-specific workflow artifacts from HTTP/JS/API responses."""
+    session_name = re.search(r'(?m)^Session:\s*(\S+)', output)
+    last_url = re.search(r'(?m)^URL:\s*(\S+)', output)
+    status = re.search(r'(?m)^HTTP Status:\s*(\d+)', output)
+    content_type = re.search(r'(?m)^Content-Type:\s*(.+)', output)
+    redirect = re.search(r'(?m)^Redirect:\s*(\S+)', output)
+    cookie_line = re.search(r'(?m)^Cookies:\s*(.+)', output)
+    if session_name:
+        cookies = []
+        if cookie_line:
+            cookies = [c.strip() for c in cookie_line.group(1).split(',') if c.strip()]
+        state.upsert_web_session(
+            session_name.group(1),
+            last_url=last_url.group(1) if last_url else '',
+            last_status=int(status.group(1)) if status else 0,
+            last_content_type=content_type.group(1).strip() if content_type else '',
+            cookies=cookies,
+            authenticated=bool(cookies),
+        )
+        if redirect:
+            state.add_note(f'Session redirect: {redirect.group(1)}')
+
+    invite_paths = (
+        '/invite',
+        '/api/v1/invite/how/to/generate',
+        '/api/v1/invite/generate',
+        '/api/v1/invite/verify',
+        '/api/v1/user/register',
+        '/api/v1/user/login',
+    )
+    for path in invite_paths:
+        if path in output:
+            state.add_note(f'Invite workflow endpoint seen: {path}')
+
+    if '/api/v1/invite/how/to/generate' in output or '/api/v1/invite/generate' in output:
+        state.upsert_hypothesis(
+            'invite_workflow',
+            'This target likely requires an invite-code workflow before account creation.',
+            status='active',
+            evidence='Invite endpoints were observed in app responses or JS.',
+        )
+
+    # Scan embedded JSON objects or bare JSON responses.
+    for candidate in re.findall(r'\{.*?\}', output, re.DOTALL):
+        try:
+            payload = json.loads(candidate)
+        except Exception:
+            continue
+        _extract_from_json_payload(payload, state)
+
+    # Some responses are just quoted/inline encoded values.
+    for encoded in re.findall(r'([A-Za-z0-9+/]{16,}={0,2})', output):
+        decoded = _safe_b64decode(encoded)
+        if not decoded:
+            continue
+        if _looks_like_invite_code(decoded):
+            state.add_loot('invite_code', decoded)
+            state.add_note(f'Invite code decoded: {decoded}')
+            state.add_note(f'Next step: POST code={decoded} to /api/v1/invite/verify')
+            state.upsert_hypothesis(
+                'invite_workflow',
+                'Decoded invite code is available; the next valid action is invite verification followed by registration.',
+                status='validated',
+                evidence=decoded,
+            )
+        elif '/api/v1/invite/generate' in decoded:
+            state.add_note(f'Decoded invite hint: {decoded}')
+
+    # ROT13 hints appear in 2million-like flows.
+    for text in re.findall(r'([A-Za-z0-9 /:._-]{20,})', output):
+        decoded = codecs.decode(text, 'rot_13')
+        if '/api/v1/invite/generate' in decoded and decoded != text:
+            state.add_note(f'Decoded ROT13 hint: {decoded}')
+
+
+def _extract_from_json_payload(payload: object, state: StateManager):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            key_lower = str(key).lower()
+            if isinstance(value, str):
+                decoded = _safe_b64decode(value)
+                if key_lower in {'data', 'code', 'invite', 'invitecode'} and decoded and _looks_like_invite_code(decoded):
+                    state.add_loot('invite_code', decoded)
+                    state.add_loot('invite_code_b64', value)
+                    state.add_note(f'Invite code decoded: {decoded}')
+                    state.add_note('Verify the invite, then register and log in.')
+                elif 'how/to/generate' in value or '/api/v1/invite/' in value:
+                    state.add_note(f'Invite API hint: {value}')
+
+                rot_decoded = codecs.decode(value, 'rot_13')
+                if '/api/v1/invite/generate' in rot_decoded and rot_decoded != value:
+                    state.add_note(f'Decoded ROT13 hint: {rot_decoded}')
+            else:
+                _extract_from_json_payload(value, state)
+    elif isinstance(payload, list):
+        for item in payload:
+            _extract_from_json_payload(item, state)
+
+
+def _safe_b64decode(value: str) -> str | None:
+    raw = (value or '').strip()
+    if len(raw) < 8 or len(raw) % 4 not in (0, 2, 3):
+        return None
+    try:
+        decoded = base64.b64decode(raw + '=' * (-len(raw) % 4), validate=False).decode('utf-8', errors='ignore').strip()
+    except Exception:
+        return None
+    if not decoded:
+        return None
+    if any(ord(ch) < 9 for ch in decoded):
+        return None
+    return decoded
+
+
+def _looks_like_invite_code(value: str) -> bool:
+    return bool(re.fullmatch(r'[A-Z0-9]{4,}(?:-[A-Z0-9]{4,}){2,}', value.strip()))
 
 
 def extract_state_from_pcap(output: str, target: str, state: StateManager):
@@ -386,8 +509,10 @@ STATE_EXTRACTORS = {
     'check_sudo': extract_state_from_command,
     'check_suid': extract_state_from_command,
     'check_cron': extract_state_from_command,
+    'check_capabilities': extract_state_from_command,
     'run_linpeas': extract_state_from_command,
     'curl_request': extract_state_from_command,
+    'web_request': extract_state_from_command,
     'send_payload': extract_state_from_command,
     'sqlmap_scan': extract_state_from_sqlmap,
     'hydra_brute': extract_state_from_hydra,

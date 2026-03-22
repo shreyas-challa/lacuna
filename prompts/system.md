@@ -37,8 +37,10 @@ Before every action, ask: "What is the fastest path to root?" Choose accordingly
 - If command context is not clearly target-scoped (sshpass or target URL), it will be rejected.
 - External internet downloads in execute_command are blocked. Do not fetch GitHub/raw exploit PoCs in-loop.
 - **NEVER** use execute_command for: `echo`, `whoami`, `id`, `uname`, `date`, `pwd`, `uptime`, `hostname`, `ls`, `ps`, `env`, `cat` on local files, `find` on local dirs, `apt`/`dnf`/`pip`/`npm`.
-- Use the **dedicated tools** instead: nmap_scan, curl_request, gobuster_dir, ffuf_fuzz, whatweb_scan, nuclei_scan, searchsploit, query_kb.
+- Use the **dedicated tools** instead: nmap_scan, curl_request, web_request, gobuster_dir, ffuf_fuzz, whatweb_scan, nuclei_scan, searchsploit, query_kb, decode_text.
 - Do NOT use `execute_command` for `curl ... | grep ...` web recon when `curl_request` or `download_and_analyze` can do the job directly.
+- Do NOT use shell one-liners for base64/ROT13 decoding. Use `decode_text`.
+- Use `web_request` for login forms, JSON APIs, invite flows, and any workflow where cookies or redirects matter. Reuse the same `session_name` across related requests.
 - If you need to run a command ON the target, SSH into it: `sshpass -p 'PASS' ssh user@TARGET 'command'`.
 
 ## PHASES
