@@ -331,7 +331,6 @@ class Agent:
         self._nmap_call_count: int = 0
         self._phase_entry_iteration = 0
         self._phase_entry_node_count = 0
-        self._last_nudge_iteration = -99
         self._knowledge_injected: set[str] = set()
         self.total_cost = 0.0
         self.total_cached_tokens = 0
@@ -426,77 +425,14 @@ class Agent:
         return ""
 
     def _get_tool_suggestions(self) -> str:
-        """Generate brief tool hints based on current state patterns."""
-        suggestions = []
+        """Expose only current task guidance, not heuristic nudges."""
         active_task = self.memory.current_plan.active_task() if self.memory.current_plan else None
         if active_task and active_task.tool_hints:
-            suggestions.append(
-                f"PLAN FOCUS: {active_task.title} — prefer {', '.join(active_task.tool_hints[:4])}"
-            )
-
-        # Web service found but not scanned
-        web_ports = [svc for svc in self.state.services.values()
-                     if svc.name in ('http', 'https', 'http-proxy')]
-        if web_ports and self._tool_call_count < 5:
-            for svc in web_ports:
-                suggestions.append(
-                    f"Web service on port {svc.port} — consider gobuster_dir or curl_request"
-                )
-
-        # Untested credentials exist
-        untested = self.state.get_untested_pairs()
-        if untested:
-            for cred, services in untested[:2]:
-                suggestions.append(
-                    f"UNTESTED CRED: {cred.username}:{cred.password} — try on {', '.join(services)}"
-                )
-
-        # Have user access but no root — suggest privesc tools
-        has_user = any(a.level == 'user' for a in self.state.accesses)
-        has_root = self.state.has_root(self.target)
-        if has_user and not has_root and self.phase == 'privesc':
-            suggestions.append(
-                "User shell obtained — run check_sudo, check_capabilities, check_suid, check_cron IN THAT ORDER before attempting exploits"
-            )
-
-        # Credentials found but still in enumeration
-        if self.state.credentials and self.phase == 'enumeration':
-            suggestions.append(
-                "Credentials discovered — consider transitioning to exploitation"
-            )
-
-        # Invite-driven footholds like 2million
-        api_endpoints = self.state.web_assets.get('api_endpoints', set())
-        notes = '\n'.join(self.state.notes)
-        markers = self.state.workflow_markers
-        if self.phase == 'enumeration':
-            if any('/api/v1/invite/how/to/generate' in ep for ep in api_endpoints):
-                suggestions.append(
-                    "Invite flow detected — fetch /api/v1/invite/generate, decode returned text with decode_text, then POST the decoded code to /api/v1/invite/verify"
-                )
-            if 'invite_code' in self.state.loot and not markers.get('invite_verified'):
-                suggestions.append(
-                    f"Decoded invite code available: {self.state.loot['invite_code']} — verify it now with web_request before doing anything broader"
-                )
-            elif 'Invite code decoded:' in notes:
-                suggestions.append(
-                    "Invite code decoded in Notes — use it with /api/v1/invite/verify before attempting registration"
-                )
-            if markers.get('invite_verified') and not markers.get('account_registered'):
-                suggestions.append(
-                    "Invite is verified — register a new account with web_request next."
-                )
-            if markers.get('account_registered') and not markers.get('authenticated_session'):
-                suggestions.append(
-                    "Account exists but no authenticated session is recorded — log in with web_request using the same session_name."
-                )
-            if self.state.web_sessions:
-                suggestions.append(
-                    "Use web_request with a stable session_name for login, registration, invite verification, and JSON API calls so cookies persist."
-                )
-
-        if suggestions:
-            return "## Suggested Actions\n" + '\n'.join(f"- {s}" for s in suggestions[:4])
+            return "## Operator Hints\n" + '\n'.join([
+                f"- Active task: {active_task.title}",
+                f"- Preferred tools: {', '.join(active_task.tool_hints[:4])}",
+                f"- Success condition: {active_task.success_criteria or 'Advance the task with one concrete action.'}",
+            ])
         return ""
 
     def _get_tools(self) -> list[dict]:
@@ -645,128 +581,6 @@ class Agent:
             )
         return None
 
-    # ── Planning & Reflection (Reasoning Layer) ──────────────────
-
-    def _inject_planning_prompt(self) -> str:
-        """Force the agent to strategize before acting in a new phase."""
-        base = (
-            f"[SYSTEM] You have entered the **{self.phase}** phase. Before taking any action, "
-            f"analyze your current position:\n"
-            f"1. What do you know so far? (services, credentials, access levels, vulnerabilities)\n"
-            f"2. What is your hypothesis for the attack path?\n"
-            f"3. What is the single highest-value next action?\n\n"
-        )
-        if self.phase == 'privesc':
-            base += (
-                "MANDATORY PRIVESC CHECKLIST — execute IN ORDER before any exploit:\n"
-                "1. check_sudo (sudo -l)\n"
-                "2. check_capabilities (getcap -r / 2>/dev/null) — cap_setuid = instant root\n"
-                "3. check_suid (find / -perm -4000 -type f 2>/dev/null)\n"
-                "4. check_cron (cat /etc/crontab; ls -la /etc/cron.d/)\n"
-                "Do NOT attempt exploitation until ALL 4 checks are complete.\n"
-                "Start with check_sudo NOW."
-            )
-        else:
-            base += (
-                "Respond with brief analysis plus exactly ONE low-cost, high-signal tool call. "
-                "Prefer dedicated tools over execute_command."
-            )
-        workflow_hint = self._get_workflow_hint()
-        if workflow_hint:
-            base += f"\n\nCurrent dominant workflow:\n{workflow_hint}"
-        return base
-
-    def _inject_reflection_prompt(self, failures: int) -> str:
-        """Force the agent to reflect after repeated failures."""
-        msg = (
-            f"[SYSTEM] You have had {failures} tool failures in the current phase. "
-            f"Stop and reflect:\n"
-            f"1. Why did these tools fail? What assumption is wrong?\n"
-            f"2. What is a fundamentally different approach you haven't tried?\n"
-            f"3. What is the single best corrective action right now?\n\n"
-            f"Respond with brief reflection plus exactly ONE materially different tool call. "
-            f"Do not repeat the same tool with the same scope. "
-            f"If in privesc, complete check_sudo/check_capabilities/check_suid/check_cron before exploit attempts."
-        )
-        workflow_hint = self._get_workflow_hint()
-        if workflow_hint:
-            msg += f"\n\nDo not drift away from the active workflow until it is confirmed or falsified:\n{workflow_hint}"
-        return msg
-
-    def _get_workflow_hint(self) -> str:
-        invite_hypothesis = self.state.hypotheses.get('invite_workflow')
-        if not invite_hypothesis or invite_hypothesis.status not in ('active', 'validated'):
-            return ''
-
-        markers = self.state.workflow_markers
-        invite_code = self.state.loot.get('invite_code', '')
-        if not markers.get('invite_code_obtained'):
-            return (
-                "- Hypothesis: invite workflow gates access.\n"
-                "- Goal: obtain an invite code from the discovered invite endpoints.\n"
-                "- Success condition: invite_code_obtained marker becomes true."
-            )
-        if not markers.get('invite_verified'):
-            return (
-                "- Hypothesis: invite verification is the blocking step.\n"
-                f"- Known artifact: invite code {invite_code}\n"
-                "- Goal: POST the code to /api/v1/invite/verify with web_request.\n"
-                "- Success condition: invite_verified marker becomes true."
-            )
-        if not markers.get('account_registered'):
-            return (
-                "- Hypothesis: account creation is now the blocking step.\n"
-                "- Goal: POST a registration request with web_request.\n"
-                "- Success condition: account_registered marker becomes true."
-            )
-        if not markers.get('authenticated_session'):
-            return (
-                "- Hypothesis: login/session creation is now the blocking step.\n"
-                "- Goal: POST credentials to /api/v1/user/login with the same session_name.\n"
-                "- Success condition: authenticated_session marker becomes true."
-            )
-        return (
-            "- Invite workflow is complete. Use the authenticated session to continue deeper application enumeration."
-        )
-
-    def _guard_workflow_drift(self, name: str, args: dict) -> str | None:
-        """Block broad scanning when a finite web workflow is already dominant."""
-        if self.memory.current_plan and self.memory.current_plan.ensure_single_active():
-            return None
-        invite_hypothesis = self.state.hypotheses.get('invite_workflow')
-        if not invite_hypothesis or invite_hypothesis.status not in ('active', 'validated'):
-            return None
-        if self.state.workflow_markers.get('authenticated_session'):
-            return None
-
-        noisy_tools = {'hydra_brute', 'gobuster_dir', 'ffuf_fuzz', 'nuclei_scan', 'nikto_scan', 'sqlmap_scan'}
-        if name in noisy_tools:
-            return (
-                "[ERROR] Dominant workflow pending: complete the invite/login workflow before broad scanning or brute force. "
-                f"Next step:\n{self._get_workflow_hint()}"
-            )
-
-        if name == 'execute_command':
-            command = str(args.get('command', '') or '')
-            if 'curl' not in command:
-                return (
-                    "[ERROR] Dominant workflow pending: use web_request/curl_request for the active invite/login workflow "
-                    "before unrelated shell actions."
-                )
-            workflow_paths = (
-                '/invite',
-                '/api/v1/invite/',
-                '/api/v1/user/register',
-                '/api/v1/user/login',
-                'inviteapi.min.js',
-            )
-            if not any(path in command for path in workflow_paths):
-                return (
-                    "[ERROR] Dominant workflow pending: this curl command is unrelated to the active invite/login path. "
-                    f"Next step:\n{self._get_workflow_hint()}"
-                )
-        return None
-
     def _guard_phase_transition(self, name: str, args: dict) -> str | None:
         if name != 'transition_phase':
             return None
@@ -810,15 +624,6 @@ class Agent:
                     f"Missing: {', '.join(missing)}."
                 )
         return None
-
-    def _is_planning_response(self) -> bool:
-        """Check if the previous message was a [SYSTEM] planning/reflection prompt."""
-        if len(self.messages) < 2:
-            return False
-        prev = self.messages[-2]
-        return (prev.get('role') == 'user' and
-                isinstance(prev.get('content', ''), str) and
-                prev['content'].startswith('[SYSTEM]'))
 
     # ── Adaptive Strategy Engine ─────────────────────────────────
 
@@ -1202,10 +1007,11 @@ class Agent:
                 phase_iterations += 1
                 self._phase_iterations_used[self.phase] = phase_iterations
 
+                active_task = self.memory.current_plan.ensure_single_active() if self.memory.current_plan else None
+
                 # ── Stagnation detection ─────────────────────────
                 iters_in_phase = self.total_iterations - self._phase_entry_iteration
                 new_nodes = len(self.graph.nodes) - self._phase_entry_node_count
-                iterations_since_nudge = self.total_iterations - self._last_nudge_iteration
 
                 # Hard stagnation: in exploitation/privesc without access for too long → complete
                 if iters_in_phase > 15 and self.phase in ('exploitation', 'privesc'):
@@ -1227,22 +1033,14 @@ class Agent:
                         self._done = True
                         break
 
-                if (
-                    iters_in_phase > 8
-                    and new_nodes == 0
-                    and iterations_since_nudge >= 5
-                    and not (self.memory.current_plan and self.memory.current_plan.ensure_single_active())
-                ):
-                    nudge = (
-                        f"[SYSTEM] You have been in the '{self.phase}' phase for {iters_in_phase} iterations "
-                        f"without discovering new information. You MUST take action NOW:\n"
-                        f"- Call a tool with a DIFFERENT approach than previous attempts\n"
-                        f"- Do NOT just analyze or summarize — execute a concrete action\n"
-                        f"- If truly stuck, call transition_phase to move on"
+                if iters_in_phase > 8 and new_nodes == 0 and active_task:
+                    self.memory.record_dead_end(
+                        f"Task stalled in {self.phase}: {active_task.title} produced no new graph state for {iters_in_phase} iterations."
                     )
-                    self.messages.append({'role': 'user', 'content': nudge, '_iteration': self._iteration_counter})
-                    self._last_nudge_iteration = self.total_iterations
-                    L.log(f"{C_YELLOW}Stagnation nudge (iter {iters_in_phase}, 0 new nodes){C_RESET}")
+                    if active_task.status == 'active':
+                        active_task.status = 'blocked'
+                    self._request_plan_refresh()
+                    L.log(f"{C_YELLOW}Task stall detected: {active_task.title} — requesting replanning{C_RESET}")
 
                 # ── Reflection injection after failures ──────────
                 if (
@@ -1251,14 +1049,13 @@ class Agent:
                 ):
                     self._request_plan_refresh()
                     self._reflection_injected_at = self.total_iterations
-                    if self.memory.current_plan and self.memory.current_plan.ensure_single_active():
-                        L.log(f"{C_YELLOW}Planner refresh after repeated failures{C_RESET}")
-                    else:
-                        reflection_msg = self._inject_reflection_prompt(self._phase_failure_count)
-                        self.messages.append({'role': 'user', 'content': reflection_msg, '_iteration': self._iteration_counter})
+                    if active_task and active_task.status == 'active':
+                        active_task.status = 'blocked'
+                        self.memory.record_dead_end(
+                            f"Blocking repeated failures on task: {active_task.title}"
+                        )
+                    L.log(f"{C_YELLOW}Planner refresh after repeated failures{C_RESET}")
                     self._phase_failure_count = 0
-                    if not (self.memory.current_plan and self.memory.current_plan.ensure_single_active()):
-                        L.log(f"{C_YELLOW}Injected reflection prompt after repeated failures{C_RESET}")
 
                 # ── Auto-complete if root flag found ─────────────
                 if self.state.has_root(self.target) and 'root_flag' in self.state.loot:
@@ -1304,15 +1101,6 @@ class Agent:
                     L.log(f"{C_YELLOW}Thinking: {text}{C_RESET}")
                     await self.manager.broadcast('agent_thinking', {'text': message.content})
 
-                    # If this was a response to a planning/reflection prompt, broadcast as strategy
-                    if self._is_planning_response():
-                        self._current_strategy = message.content
-                        await self.manager.broadcast('strategy_update', {
-                            'strategy': message.content,
-                            'phase': self.phase,
-                        })
-                        L.log(f"{C_CYAN}Strategy update broadcast{C_RESET}")
-
                 assistant_msg = {'role': 'assistant', 'content': message.content or '', '_iteration': self._iteration_counter}
                 if message.tool_calls:
                     assistant_msg['tool_calls'] = [
@@ -1333,15 +1121,14 @@ class Agent:
                     consecutive_stops += 1
                     L.log(f"{C_DIM}No tool calls (stop #{consecutive_stops}){C_RESET}")
 
-                    active_task = self.memory.current_plan.active_task() if self.memory.current_plan else None
-                    if consecutive_stops == 1 and active_task and active_task.status in ('active', 'pending'):
-                        focus_msg = (
-                            f"[SYSTEM] The active plan task is still unfinished: {active_task.title}.\n"
-                            f"Success condition: {active_task.success_criteria or 'Advance this task with one concrete tool call.'}\n"
-                            f"Respond with exactly one tool call that advances this task."
+                    active_task = self.memory.current_plan.ensure_single_active() if self.memory.current_plan else None
+                    if active_task and active_task.status in ('active', 'pending'):
+                        active_task.status = 'blocked'
+                        self.memory.record_dead_end(
+                            f"Operator returned no tool calls while task remained open: {active_task.title}"
                         )
-                        self.messages.append({'role': 'user', 'content': focus_msg, '_iteration': self._iteration_counter})
-                        L.log(f"{C_CYAN}Reinforcing active task: {active_task.title}{C_RESET}")
+                        self._request_plan_refresh()
+                        L.log(f"{C_CYAN}Blocked task after no-tool response: {active_task.title}{C_RESET}")
                         continue
 
                     if consecutive_stops >= 2:
@@ -1352,19 +1139,11 @@ class Agent:
                         has_vulns = bool(self.state.findings)
 
                         if current_idx == 0 and not has_creds and not has_access and not has_vulns:
-                            # Still in enumeration with nothing — inject a nudge instead of advancing
-                            nudge = (
-                                "[SYSTEM] You are stuck in enumeration without findings. "
-                                "Focus on actionable steps:\n"
-                                "1. Add discovered hostnames to /etc/hosts if needed\n"
-                                "2. Try registering an account on any web app\n"
-                                "3. Try API endpoint fuzzing with ffuf_fuzz\n"
-                                "4. Try default credentials with hydra_brute\n"
-                                "5. Look for invite codes, registration forms, or API docs\n"
-                                "Do NOT just analyze — take a concrete action with a tool call."
+                            self.memory.record_dead_end(
+                                "Enumeration exhausted without actionable findings; planner must switch surfaces or terminate."
                             )
-                            self.messages.append({'role': 'user', 'content': nudge, '_iteration': self._iteration_counter})
-                            L.log(f"{C_YELLOW}Enum stuck nudge — redirecting instead of advancing{C_RESET}")
+                            self._request_plan_refresh()
+                            L.log(f"{C_YELLOW}Enumeration exhausted without findings — requesting replanning{C_RESET}")
                             consecutive_stops = 0
                             continue
 
@@ -1401,7 +1180,6 @@ class Agent:
                     if sanitize_note:
                         L.log(f"{C_YELLOW}Args sanitized for {name}: {sanitize_note}{C_RESET}")
                     plan_drift_error = self._guard_plan_drift(name, args)
-                    drift_error = self._guard_workflow_drift(name, args)
                     transition_error = self._guard_phase_transition(name, args)
 
                     call_id = tc.id
@@ -1426,8 +1204,6 @@ class Agent:
                         # ── curl redirect check ──────────────
                         if plan_drift_error:
                             result = plan_drift_error
-                        elif drift_error:
-                            result = drift_error
                         elif transition_error:
                             result = transition_error
                         elif name == 'execute_command':
