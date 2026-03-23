@@ -288,7 +288,7 @@ class Planner:
         self.client = client
         self.target = target
         configured = os.getenv("LACUNA_PLANNER_MODEL", "").strip()
-        self.model_override = configured or self._default_codex_planner_model()
+        self.model_override = configured or self._default_planner_model()
         self.backend_override = self._choose_backend(configured)
 
     async def build_plan(self, phase: str, state_snapshot: dict, memory_snapshot: dict) -> PlanBuildResult:
@@ -508,20 +508,22 @@ class Planner:
         return AttackPlan(objective=objective, tasks=tasks, source="template", rationale=rationale)
 
     @staticmethod
-    def _default_codex_planner_model() -> str:
-        if not _codex_auth_exists():
-            return ""
-        return os.getenv("LACUNA_CODEX_PLANNER_MODEL", "").strip() or "gpt-5.3-codex"
+    def _default_planner_model() -> str:
+        if os.getenv("MINIMAX_API_KEY"):
+            return os.getenv("LACUNA_MINIMAX_MODEL", "").strip() or "MiniMax-M2.7"
+        return ""
 
     @staticmethod
     def _choose_backend(configured_model: str) -> str | None:
         forced = os.getenv("LACUNA_PLANNER_BACKEND", "").strip().lower()
         if forced:
             return forced
+        if configured_model and "minimax" in configured_model.lower():
+            return "minimax"
         if configured_model and "codex" in configured_model.lower():
             return "codex"
-        if _codex_auth_exists():
-            return "codex"
+        if os.getenv("MINIMAX_API_KEY"):
+            return "minimax"
         return None
 
     @staticmethod
@@ -584,9 +586,3 @@ def _slugify(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return cleaned[:48]
 
-
-def _codex_auth_exists() -> bool:
-    codex_home = os.getenv("CODEX_HOME", "")
-    if codex_home and os.path.exists(os.path.join(codex_home, "auth.json")):
-        return True
-    return os.path.exists(os.path.expanduser("~/.codex/auth.json"))
