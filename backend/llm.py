@@ -1,4 +1,4 @@
-"""LLM client — OpenAI API, Codex OAuth, Anthropic OAuth, MiniMax with auto-fallback.
+"""LLM client — OpenAI API, MiniMax, Anthropic OAuth, Codex OAuth with auto-fallback.
 
 Supports four backends:
   - openai: Standard OpenAI API with API key ($OPENAI_API_KEY)
@@ -6,7 +6,8 @@ Supports four backends:
   - anthropic: Anthropic API key or Claude Code OAuth (~/.claude/.credentials.json)
   - minimax: MiniMax API with API key ($MINIMAX_API_KEY) — OpenAI-compatible endpoint
 
-Auto-detection picks the first available backend based on credentials.
+Auto-detection prefers project APIs first. Codex is treated as backup-only
+unless explicitly selected via environment.
 Auto-fallback transparently switches when a backend hits quota/rate limits.
 """
 
@@ -51,14 +52,14 @@ def _detect_backend() -> str:
     configured = os.getenv("LACUNA_BACKEND", "auto").lower()
     if configured != "auto":
         return configured
-    if os.getenv("OPENAI_API_KEY"):
-        return "openai"
-    if _codex_creds_exist():
-        return "codex"
     if os.getenv("MINIMAX_API_KEY"):
         return "minimax"
+    if os.getenv("OPENAI_API_KEY"):
+        return "openai"
     if os.getenv("ANTHROPIC_API_KEY") or (Path.home() / ".claude" / ".credentials.json").exists():
         return "anthropic"
+    if _codex_creds_exist():
+        return "codex"
     return "openai"  # will fail with helpful error
 
 
@@ -108,10 +109,10 @@ _anthropic_client = None  # Anthropic client (lazy)
 _minimax_client = None   # MiniMax AsyncOpenAI client (lazy)
 
 _FALLBACK_ORDER = {
-    "openai": ["codex", "minimax", "anthropic"],
+    "openai": ["minimax", "anthropic", "codex"],
     "codex": ["minimax", "anthropic", "openai"],
-    "anthropic": ["openai", "minimax", "codex"],
-    "minimax": ["codex", "anthropic", "openai"],
+    "anthropic": ["minimax", "openai", "codex"],
+    "minimax": ["openai", "anthropic", "codex"],
 }
 
 
