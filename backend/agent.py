@@ -332,13 +332,7 @@ class Agent:
         self._tool_failures: dict[str, int] = {}
         # Reasoning layer tracking
         self._plan_injected_for_phase: set[str] = set()
-        self._phase_failure_count: int = 0
-        self._reflection_injected_at: int = -99
         self._current_strategy: str = ''
-        # Consecutive wasted iteration tracker (blocked/warned/cached/no-op tool calls)
-        self._consecutive_waste: int = 0
-        # Same-file repetition tracker: "/tmp/filename" -> count of commands with empty results
-        self._file_analysis_count: dict[str, int] = {}
         # Iteration counter for context windowing
         self._iteration_counter: int = 0
         # Shell session tracking
@@ -354,6 +348,10 @@ class Agent:
         self._phase_iterations_used: dict[str, int] = {phase: 0 for phase in PHASES}
         self._plan_refresh_required: bool = True
         self._last_state_fingerprint = self._state_fingerprint()
+        self._last_progress_fingerprint = self._last_state_fingerprint
+        self._last_progress_iteration: int = 0
+        self._tracked_task_id: str = ''
+        self._active_task_stall_count: int = 0
         self._planner_calls: int = 0
 
     def _get_knowledge_hints(self) -> str:
@@ -389,14 +387,39 @@ class Agent:
     def _state_fingerprint(self) -> tuple:
         return (
             self.phase,
-            len(self.state.services),
-            len(self.state.credentials),
-            len(self.state.accesses),
-            len(self.state.findings),
-            len(self.state.loot),
+            tuple(sorted(
+                (svc.host, svc.port, svc.protocol, svc.name, svc.version, svc.info)
+                for svc in self.state.services.values()
+            )),
+            tuple(sorted(self.state.credentials.keys())),
+            tuple(sorted(
+                (access.host, access.user, access.level, access.method)
+                for access in self.state.accesses
+            )),
+            tuple(sorted(
+                (finding.title, finding.severity, finding.service)
+                for finding in self.state.findings
+            )),
+            tuple(sorted(self.state.loot.items())),
             tuple(sorted(key for key, value in self.state.workflow_markers.items() if value)),
-            len(self.state.hypotheses),
-            tuple(sorted(self.state.web_sessions.keys())),
+            tuple(sorted(
+                (hyp.key, hyp.status, hyp.evidence)
+                for hyp in self.state.hypotheses.values()
+            )),
+            tuple(sorted(
+                (
+                    session.name,
+                    session.last_url,
+                    session.last_status,
+                    session.authenticated,
+                    tuple(sorted(session.cookies)),
+                )
+                for session in self.state.web_sessions.values()
+            )),
+            tuple(
+                (category, tuple(sorted(values)))
+                for category, values in sorted(self.state.web_assets.items())
+            ),
         )
 
     def _request_plan_refresh(self):
@@ -622,6 +645,7 @@ class Agent:
             self._request_plan_refresh()
             self._phase_entry_iteration = self.total_iterations
             self._phase_entry_node_count = len(self.graph.nodes)
+            self._last_progress_iteration = self.total_iterations
             await self.manager.broadcast('phase_change', {'phase': self.phase})
             self.journal.write('phase_change', {'phase': self.phase, 'reason': 'user access detected'})
             return
@@ -636,6 +660,7 @@ class Agent:
             self._request_plan_refresh()
             self._phase_entry_iteration = self.total_iterations
             self._phase_entry_node_count = len(self.graph.nodes)
+            self._last_progress_iteration = self.total_iterations
             await self.manager.broadcast('phase_change', {'phase': self.phase})
             self.journal.write('phase_change', {'phase': self.phase, 'reason': 'credentials discovered'})
             return
@@ -651,6 +676,7 @@ class Agent:
                     self._request_plan_refresh()
                     self._phase_entry_iteration = self.total_iterations
                     self._phase_entry_node_count = len(self.graph.nodes)
+                    self._last_progress_iteration = self.total_iterations
                     await self.manager.broadcast('phase_change', {'phase': self.phase})
                     self.journal.write('phase_change', {'phase': self.phase, 'reason': f'critical exploit match for {svc.name}'})
                     return
@@ -834,7 +860,6 @@ class Agent:
                     await self._broadcast_budget()
                     continue
             consecutive_stops = 0
-            self._phase_failure_count = 0
 
             if self.phase not in self._plan_injected_for_phase and self.total_iterations > 0:
                 self._plan_injected_for_phase.add(self.phase)
@@ -848,54 +873,34 @@ class Agent:
                 self._phase_iterations_used[self.phase] = phase_iterations
 
                 active_task = self.memory.current_plan.ensure_single_active() if self.memory.current_plan else None
+                active_task_id = active_task.id if active_task else ''
+                if active_task_id != self._tracked_task_id:
+                    self._tracked_task_id = active_task_id
+                    self._active_task_stall_count = 0
 
                 # ── Stagnation detection ─────────────────────────
                 iters_in_phase = self.total_iterations - self._phase_entry_iteration
-                new_nodes = len(self.graph.nodes) - self._phase_entry_node_count
+                iters_since_progress = self.total_iterations - self._last_progress_iteration
 
                 # Hard stagnation: in exploitation/privesc without access for too long → complete
-                if iters_in_phase > 15 and self.phase in ('exploitation', 'privesc'):
+                if iters_since_progress > 15 and self.phase in ('exploitation', 'privesc'):
                     has_access = bool(self.state.accesses)
                     has_creds = bool(self.state.credentials)
                     if not has_access and not has_creds:
-                        L.log(f"{C_RED}Hard stagnation: {self.phase} for {iters_in_phase} iters without access/creds — completing{C_RESET}")
+                        L.log(f"{C_RED}Hard stagnation: {self.phase} for {iters_since_progress} iterations without state progress — completing{C_RESET}")
                         self.phase = 'complete'
                         self._done = True
                         break
 
                 # Hard stagnation: enumeration spinning without progress → force transition
-                if iters_in_phase > 25 and self.phase == 'enumeration' and new_nodes == 0:
+                if iters_since_progress > 25 and self.phase == 'enumeration':
                     has_creds = bool(self.state.credentials)
                     has_access = bool(self.state.accesses)
                     if not has_creds and not has_access:
-                        L.log(f"{C_RED}Hard stagnation: enumeration for {iters_in_phase} iters with 0 new nodes — completing{C_RESET}")
+                        L.log(f"{C_RED}Hard stagnation: enumeration for {iters_since_progress} iterations without state progress — completing{C_RESET}")
                         self.phase = 'complete'
                         self._done = True
                         break
-
-                if iters_in_phase > 8 and new_nodes == 0 and active_task:
-                    self.memory.record_dead_end(
-                        f"Task stalled in {self.phase}: {active_task.title} produced no new graph state for {iters_in_phase} iterations."
-                    )
-                    if active_task.status == 'active':
-                        active_task.status = 'blocked'
-                    self._request_plan_refresh()
-                    L.log(f"{C_YELLOW}Task stall detected: {active_task.title} — requesting replanning{C_RESET}")
-
-                # ── Reflection injection after failures ──────────
-                if (
-                    self._phase_failure_count >= 2 and
-                    self.total_iterations - self._reflection_injected_at > 3
-                ):
-                    self._request_plan_refresh()
-                    self._reflection_injected_at = self.total_iterations
-                    if active_task and active_task.status == 'active':
-                        active_task.status = 'blocked'
-                        self.memory.record_dead_end(
-                            f"Blocking repeated failures on task: {active_task.title}"
-                        )
-                    L.log(f"{C_YELLOW}Planner refresh after repeated failures{C_RESET}")
-                    self._phase_failure_count = 0
 
                 # ── Auto-complete if root flag found ─────────────
                 if self.state.has_root(self.target) and 'root_flag' in self.state.loot:
@@ -1019,6 +1024,7 @@ class Agent:
                     continue
 
                 consecutive_stops = 0
+                iteration_progress = False
 
                 # ── Process tool calls ───────────────────────────
                 should_break = False
@@ -1116,7 +1122,6 @@ class Agent:
                     # Circuit breaker: track consecutive failures per tool
                     if result.startswith('[ERROR]') or result.startswith('[TIMEOUT'):
                         self._tool_failures[name] = self._tool_failures.get(name, 0) + 1
-                        self._phase_failure_count += 1
                         self.memory.record_dead_end(f"{name}: {result.splitlines()[0][:180]}")
                         if self._tool_failures[name] >= 2:
                             L.log(f"{C_RED}Circuit breaker: {name} failed {self._tool_failures[name]}x — temporarily disabled{C_RESET}")
@@ -1124,40 +1129,6 @@ class Agent:
                         self._tool_failures.pop(name, None)
                         if name in {'check_sudo', 'check_capabilities', 'check_suid', 'check_cron'}:
                             self._privesc_checks_done.add(name)
-
-                    # ── Waste tracking ────────────────────────────
-                    _is_waste = (
-                        result.startswith('[ERROR]') or
-                        result.startswith('[WARNING]') or
-                        result.startswith('[CACHED') or
-                        (name == 'execute_command' and len(result.strip()) == 0)
-                    )
-                    if _is_waste:
-                        self._consecutive_waste += 1
-                        if self._consecutive_waste >= 5:
-                            self.memory.record_dead_end(
-                                f"Five consecutive low-value actions occurred during {self.phase}; replan around a different surface."
-                            )
-                            self._request_plan_refresh()
-                            self._consecutive_waste = 0
-                            L.log(f"{C_RED}Waste detector: 5+ consecutive wasted calls — triggering planner refresh{C_RESET}")
-                    else:
-                        self._consecutive_waste = 0
-
-                    # ── Same-file repetition detection ────────────
-                    if name == 'execute_command' and len(result.strip()) < 50:
-                        cmd_str = args.get('command', '')
-                        tmp_files = re.findall(r'/tmp/\S+', cmd_str)
-                        for tf in tmp_files:
-                            tf_clean = tf.rstrip("'\"`;|&)")
-                            self._file_analysis_count[tf_clean] = self._file_analysis_count.get(tf_clean, 0) + 1
-                            if self._file_analysis_count[tf_clean] >= 3:
-                                self.memory.record_dead_end(
-                                    f"Repeatedly analyzed {tf_clean} without useful output; deprioritize this artifact."
-                                )
-                                self._request_plan_refresh()
-                                L.log(f"{C_RED}Repetition detector: {tf_clean} analyzed {self._file_analysis_count[tf_clean]}x — planner refresh requested{C_RESET}")
-                                break
 
                     analysis = self.analyzer.analyze(name, args, result)
                     self.memory.record_observation(analysis.observation)
@@ -1171,6 +1142,11 @@ class Agent:
                     if analysis.web_assets_added:
                         L.log(f"{C_CYAN}Analyzer extracted {analysis.web_assets_added} web asset(s){C_RESET}")
                     new_fingerprint = self._state_fingerprint()
+                    if new_fingerprint != self._last_progress_fingerprint:
+                        self._last_progress_fingerprint = new_fingerprint
+                        self._last_progress_iteration = self.total_iterations
+                        self._active_task_stall_count = 0
+                        iteration_progress = True
                     if new_fingerprint != self._last_state_fingerprint or analysis.plan_refresh_required:
                         self._request_plan_refresh()
                         self._last_state_fingerprint = new_fingerprint
@@ -1183,6 +1159,7 @@ class Agent:
                         'graph_edges_added': analysis.graph_edges_added,
                         'discovered_hosts': analysis.discovered_hosts,
                         'web_assets_added': analysis.web_assets_added,
+                        'state_changed': analysis.state_changed,
                         'plan_refresh_required': analysis.plan_refresh_required,
                     })
 
@@ -1214,6 +1191,9 @@ class Agent:
 
                         self._phase_entry_iteration = self.total_iterations
                         self._phase_entry_node_count = len(self.graph.nodes)
+                        self._last_progress_iteration = self.total_iterations
+                        self._tracked_task_id = ''
+                        self._active_task_stall_count = 0
 
                         L.log(f"\n{C_MAGENTA}{'='*40}{C_RESET}")
                         L.log(f"{C_MAGENTA}Phase: {self.phase.upper()}{C_RESET}")
@@ -1236,6 +1216,19 @@ class Agent:
                             '[SKIPPED — phase transition or completion in progress]',
                         )
                     break
+
+                if message.tool_calls and not should_break and active_task:
+                    if iteration_progress:
+                        self._active_task_stall_count = 0
+                    else:
+                        self._active_task_stall_count += 1
+                        if self._active_task_stall_count >= 4 and active_task.status in ('active', 'pending'):
+                            active_task.status = 'blocked'
+                            self.memory.record_dead_end(
+                                f"Task stalled without durable state progress: {active_task.title}"
+                            )
+                            self._request_plan_refresh()
+                            L.log(f"{C_YELLOW}Task stall detected: {active_task.title} — requesting replanning{C_RESET}")
 
         # ── Final summary ────────────────────────────────────────
         L.header(f"\n{C_BOLD}{C_BLUE}{'='*60}{C_RESET}")
