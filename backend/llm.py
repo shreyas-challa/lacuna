@@ -15,6 +15,7 @@ import json
 import asyncio
 import base64
 import time
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -181,30 +182,44 @@ def _get_minimax_client():
 
 # ── Main chat completion with auto-fallback ──────────────────────
 
-async def chat_completion(client, messages: list, tools: list | None = None):
+async def chat_completion(
+    client,
+    messages: list,
+    tools: list | None = None,
+    backend_override: str | None = None,
+    model_override: str | None = None,
+    max_tokens: int = 4096,
+    temperature: float | None = None,
+):
     """Call the LLM with retry logic and auto-fallback.
 
     Returns a response object with OpenAI-compatible structure regardless
     of which backend actually served the request.
     """
     global _active_backend
+    initial_backend = backend_override or _active_backend
 
     try:
-        return await _dispatch(_active_backend, client, messages, tools)
+        response = await _dispatch(initial_backend, client, messages, tools, model_override, max_tokens, temperature)
+        if not backend_override:
+            _active_backend = initial_backend
+        return response
     except Exception as e:
         if not FALLBACK_ENABLED or not _is_switchable_error(e):
             raise
         # Try fallback backends in order
-        for fallback in _FALLBACK_ORDER.get(_active_backend, []):
+        for fallback in _FALLBACK_ORDER.get(initial_backend, []):
             try:
-                _active_backend = fallback
-                return await _dispatch(fallback, client, messages, tools)
+                response = await _dispatch(fallback, client, messages, tools, model_override, max_tokens, temperature)
+                if not backend_override:
+                    _active_backend = fallback
+                return response
             except Exception:
                 continue
         raise  # all fallbacks failed
 
 
-async def _dispatch(backend: str, client, messages, tools):
+async def _dispatch(backend: str, client, messages, tools, model_override, max_tokens, temperature):
     global _codex_auth, _anthropic_client, _minimax_client
     if backend == "openai":
         if client is None:
@@ -213,19 +228,19 @@ async def _dispatch(backend: str, client, messages, tools):
             if not api_key:
                 raise ValueError("No OpenAI API key for fallback")
             client = AsyncOpenAI(api_key=api_key)
-        return await _openai_completion(client, messages, tools)
+        return await _openai_completion(client, messages, tools, model_override=model_override, max_tokens=max_tokens, temperature=temperature)
     elif backend == "codex":
         if not _codex_auth:
             _codex_auth = CodexAuth()
-        return await _codex_completion(messages, tools)
+        return await _codex_completion(messages, tools, model_override=model_override, max_tokens=max_tokens)
     elif backend == "minimax":
         if not _minimax_client:
             _minimax_client = _get_minimax_client()
-        return await _minimax_completion(_minimax_client, messages, tools)
+        return await _minimax_completion(_minimax_client, messages, tools, model_override=model_override, max_tokens=max_tokens, temperature=temperature)
     else:
         if not _anthropic_client:
             _anthropic_client = _get_anthropic_client()
-        return await _anthropic_completion(_anthropic_client, messages, tools)
+        return await _anthropic_completion(_anthropic_client, messages, tools, model_override=model_override, max_tokens=max_tokens, temperature=temperature)
 
 
 def _is_switchable_error(e: Exception) -> bool:
@@ -242,12 +257,22 @@ def _is_switchable_error(e: Exception) -> bool:
 #  OpenAI Chat Completions backend
 # ═════════════════════════════════════════════════════════════════
 
-async def _openai_completion(client, messages: list, tools: list | None):
+async def _openai_completion(
+    client,
+    messages: list,
+    tools: list | None,
+    *,
+    model_override: str | None = None,
+    max_tokens: int = 4096,
+    temperature: float | None = None,
+):
     kwargs = {
-        'model': OPENAI_MODEL,
+        'model': model_override or OPENAI_MODEL,
         'messages': messages,
-        'max_tokens': 4096,
+        'max_tokens': max_tokens,
     }
+    if temperature is not None:
+        kwargs['temperature'] = temperature
     if tools:
         kwargs['tools'] = tools
         kwargs['tool_choice'] = 'auto'
@@ -324,7 +349,75 @@ def _clean_minimax_messages(messages: list) -> list:
     return merged
 
 
-async def _minimax_completion(client, messages: list, tools: list | None):
+_llm_logger = logging.getLogger('lacuna.llm')
+
+
+def _validate_tool_call_ordering(messages: list) -> list:
+    """Final validation: every assistant tool_call must have its results immediately after.
+
+    Defensive safety net that runs after all message cleaning/merging.
+    Fixes violations in-place and logs warnings for post-mortem.
+    """
+    fixed = []
+    i = 0
+    violations = 0
+
+    while i < len(messages):
+        msg = messages[i]
+
+        if msg.get('role') == 'assistant' and msg.get('tool_calls'):
+            fixed.append(msg)
+            i += 1
+
+            expected_ids = {tc['id'] if isinstance(tc, dict) else tc.id
+                           for tc in msg['tool_calls']}
+            tool_results = []
+            deferred = []
+
+            # Scan forward for matching tool results
+            while i < len(messages) and expected_ids:
+                next_msg = messages[i]
+                if next_msg.get('role') == 'tool' and next_msg.get('tool_call_id') in expected_ids:
+                    tool_results.append(next_msg)
+                    expected_ids.discard(next_msg['tool_call_id'])
+                    i += 1
+                elif next_msg.get('role') in ('user', 'system'):
+                    deferred.append(next_msg)
+                    violations += 1
+                    i += 1
+                else:
+                    break
+
+            # Synthesize placeholders for any missing results
+            for missing_id in expected_ids:
+                tool_results.append({
+                    'role': 'tool',
+                    'tool_call_id': missing_id,
+                    'content': '[No result recorded]',
+                })
+                violations += 1
+
+            fixed.extend(tool_results)
+            fixed.extend(deferred)
+        else:
+            fixed.append(msg)
+            i += 1
+
+    if violations:
+        _llm_logger.warning(f"_validate_tool_call_ordering: fixed {violations} ordering violation(s)")
+
+    return fixed
+
+
+async def _minimax_completion(
+    client,
+    messages: list,
+    tools: list | None,
+    *,
+    model_override: str | None = None,
+    max_tokens: int = 4096,
+    temperature: float | None = None,
+):
     """MiniMax uses OpenAI-compatible chat completions — same format, different model.
 
     Key differences from OpenAI:
@@ -334,12 +427,13 @@ async def _minimax_completion(client, messages: list, tools: list | None):
     """
     # Strip <think> tags from prior assistant messages to save tokens
     clean_msgs = _clean_minimax_messages(messages)
+    clean_msgs = _validate_tool_call_ordering(clean_msgs)
 
     kwargs = {
-        'model': MINIMAX_MODEL,
+        'model': model_override or MINIMAX_MODEL,
         'messages': clean_msgs,
-        'max_tokens': 4096,
-        'temperature': 1.0,  # MiniMax requires (0, 1]; recommended: 1.0
+        'max_tokens': max_tokens,
+        'temperature': temperature if temperature is not None else 1.0,
     }
     if tools:
         kwargs['tools'] = tools
@@ -505,7 +599,13 @@ class CodexAuth:
         return headers
 
 
-async def _codex_completion(messages: list, tools: list | None):
+async def _codex_completion(
+    messages: list,
+    tools: list | None,
+    *,
+    model_override: str | None = None,
+    max_tokens: int = 4096,
+):
     """Call Codex endpoint with SSE streaming (required by chatgpt.com backend).
 
     The chatgpt.com/backend-api/codex endpoint requires stream=true.
@@ -516,11 +616,12 @@ async def _codex_completion(messages: list, tools: list | None):
     system, input_items = _translate_messages_for_codex(messages)
 
     body = {
-        "model": CODEX_MODEL,
+        "model": model_override or CODEX_MODEL,
         "instructions": system or "You are a helpful assistant.",
         "input": input_items,
         "store": False,
         "stream": True,
+        "max_output_tokens": max_tokens,
     }
     if tools:
         body["tools"] = _translate_tools_for_codex(tools)
@@ -735,15 +836,25 @@ def _wrap_codex_response(data: dict):
 #  Anthropic backend
 # ═════════════════════════════════════════════════════════════════
 
-async def _anthropic_completion(client, messages: list, tools: list | None):
+async def _anthropic_completion(
+    client,
+    messages: list,
+    tools: list | None,
+    *,
+    model_override: str | None = None,
+    max_tokens: int = 4096,
+    temperature: float | None = None,
+):
     system, translated_msgs = _translate_messages_for_anthropic(messages)
     anthropic_tools = _translate_tools_for_anthropic(tools) if tools else None
 
     kwargs = {
-        'model': ANTHROPIC_MODEL,
-        'max_tokens': 4096,
+        'model': model_override or ANTHROPIC_MODEL,
+        'max_tokens': max_tokens,
         'messages': translated_msgs,
     }
+    if temperature is not None:
+        kwargs['temperature'] = temperature
     if system:
         kwargs['system'] = system
     if anthropic_tools:
@@ -920,7 +1031,7 @@ class _Response:
 #  Usage extraction (works for all backends)
 # ═════════════════════════════════════════════════════════════════
 
-def extract_usage(response) -> dict:
+def extract_usage(response, model: str | None = None) -> dict:
     usage = getattr(response, 'usage', None)
     if not usage:
         return {'input': 0, 'output': 0, 'cached': 0, 'cost': 0.0}
@@ -933,6 +1044,6 @@ def extract_usage(response) -> dict:
     if details:
         cached = getattr(details, 'cached_tokens', 0) or 0
 
-    model = get_active_model()
-    cost = estimate_cost(model, inp, out, cached)
+    effective_model = model or get_active_model()
+    cost = estimate_cost(effective_model, inp, out, cached)
     return {'input': inp, 'output': out, 'cached': cached, 'cost': cost}

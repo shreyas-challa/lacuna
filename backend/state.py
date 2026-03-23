@@ -404,3 +404,74 @@ class StateManager:
             return "## Agent State\nNo discoveries yet."
 
         return '\n\n'.join(sections)
+
+    def to_snapshot(self) -> dict:
+        """Return a JSON-serializable structured state snapshot for planning."""
+        return {
+            'credentials': [
+                {
+                    'username': cred.username,
+                    'password': cred.password,
+                    'source': cred.source,
+                    'verified_for': list(cred.verified_for),
+                    'failed_for': list(cred.failed_for),
+                }
+                for cred in self.credentials.values()
+            ],
+            'accesses': [
+                {
+                    'host': access.host,
+                    'user': access.user,
+                    'level': access.level,
+                    'method': access.method,
+                }
+                for access in self.accesses
+            ],
+            'services': [
+                {
+                    'host': svc.host,
+                    'port': svc.port,
+                    'protocol': svc.protocol,
+                    'name': svc.name,
+                    'version': svc.version,
+                    'info': svc.info,
+                }
+                for svc in sorted(self.services.values(), key=lambda item: item.port)
+            ],
+            'findings': [
+                {
+                    'title': finding.title,
+                    'severity': finding.severity,
+                    'service': finding.service,
+                    'description': finding.description,
+                    'evidence': finding.evidence,
+                    'cve': finding.cve,
+                }
+                for finding in self.findings
+            ],
+            'loot': dict(self.loot),
+            'notes': list(self.notes),
+            'workflow_markers': sorted(key for key, value in self.workflow_markers.items() if value),
+            'web_sessions': [
+                {
+                    'name': session.name,
+                    'base_url': session.base_url,
+                    'last_url': session.last_url,
+                    'last_status': session.last_status,
+                    'last_content_type': session.last_content_type,
+                    'authenticated': session.authenticated,
+                    'cookies': list(session.cookies),
+                }
+                for session in self.web_sessions.values()
+            ],
+            'web_assets': {key: sorted(values) for key, values in self.web_assets.items()},
+            'hypotheses': [
+                {
+                    'key': hyp.key,
+                    'description': hyp.description,
+                    'status': hyp.status,
+                    'evidence': hyp.evidence,
+                }
+                for hyp in self.hypotheses.values()
+            ],
+        }
