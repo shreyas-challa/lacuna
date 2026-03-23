@@ -1,6 +1,9 @@
 import os
 import re
 import ipaddress
+import base64
+import codecs
+from urllib.parse import unquote
 from backend.tools.base import tool, run_command
 from backend.knowledge import query_knowledge_base
 
@@ -324,6 +327,58 @@ async def download_and_analyze(url: str, filename: str) -> str:
 
 
 @tool(
+    name='decode_text',
+    description='Decode or transform text without shell execution. Supports base64, rot13, URL decoding, and auto-detection. Use this instead of execute_command for invite codes, tokens, or obfuscated hints.',
+    parameters={
+        'type': 'object',
+        'properties': {
+            'text': {'type': 'string', 'description': 'Text to decode or transform'},
+            'mode': {
+                'type': 'string',
+                'enum': ['auto', 'base64', 'rot13', 'url'],
+                'description': 'Decode mode (default: auto)',
+                'default': 'auto',
+            },
+        },
+        'required': ['text'],
+    },
+    phases=['enumeration'],
+)
+async def decode_text(text: str, mode: str = 'auto') -> str:
+    raw = (text or '').strip()
+    if not raw:
+        return '[ERROR] No text provided to decode.'
+
+    attempts: list[tuple[str, str]] = []
+    chosen = (mode or 'auto').strip().lower()
+
+    if chosen in ('auto', 'base64'):
+        try:
+            padded = raw + '=' * (-len(raw) % 4)
+            decoded = base64.b64decode(padded, validate=False).decode('utf-8', errors='replace').strip()
+            if decoded:
+                attempts.append(('base64', decoded))
+        except Exception:
+            pass
+
+    if chosen in ('auto', 'rot13'):
+        decoded = codecs.decode(raw, 'rot_13')
+        if decoded and decoded != raw and (chosen == 'rot13' or _looks_like_meaningful_text(decoded)):
+            attempts.append(('rot13', decoded))
+
+    if chosen in ('auto', 'url'):
+        decoded = unquote(raw)
+        if decoded and decoded != raw and (chosen == 'url' or _looks_like_meaningful_text(decoded)):
+            attempts.append(('url', decoded))
+
+    if not attempts:
+        return '[ERROR] Could not decode text with the selected mode(s).'
+
+    lines = [f'{kind}: {decoded}' for kind, decoded in attempts]
+    return '\n'.join(lines)
+
+
+@tool(
     name='execute_command',
     description='Execute a shell command for TARGET interaction: curl to target, sshpass SSH, '
                 'file analysis, exploit compilation. Do NOT use for local system admin '
@@ -367,6 +422,15 @@ async def _execute_command_guarded(command: str, target: str = '') -> str:
     # (status messages like "echo Preparing...", "echo Analysis ready", etc.)
     if cmd_lower.startswith('echo ') and '|' not in cmd_stripped and '>>' not in cmd_stripped and 'tee' not in cmd_lower:
         return "[ERROR] Do not echo status messages — call a tool that advances the engagement."
+
+    # Redirect decode attempts to the dedicated transform tool.
+    if (
+        'base64 -d' in cmd_lower
+        or "import base64" in cmd_lower
+        or "codecs.decode" in cmd_lower
+        or ("tr 'a-za-z'" in cmd_lower and "'n-za-mn-za-m'" in cmd_lower)
+    ):
+        return "[ERROR] Use decode_text for base64/ROT13 decoding instead of execute_command."
 
     # Disallow external internet payload fetching inside execute_command.
     # execute_command is for target interaction, not downloading random exploit PoCs locally.
@@ -489,6 +553,14 @@ def _is_safe_local_tmp_read(command: str) -> bool:
     if any(tok in cmd_lower for tok in (' >', '>>', '<<', 'chmod ', './', 'bash ', 'python ', 'python3 ')):
         return False
     return True
+
+
+def _looks_like_meaningful_text(text: str) -> bool:
+    return (
+        '/api/' in text
+        or 'http' in text
+        or bool(re.search(r'\b(?:the|and|order|request|generate|invite|code|post)\b', text, re.IGNORECASE))
+    )
 
 
 @tool(

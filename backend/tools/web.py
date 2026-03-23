@@ -19,7 +19,11 @@ from backend.tools.base import tool, run_command
     phases=['enumeration'],
 )
 async def sqlmap_scan(url: str, flags: str = '--batch --dbs') -> str:
-    return await run_command(f'sqlmap -u "{url}" {flags}', timeout=300)
+    safe_flags = (flags or '').strip() or '--batch --dbs'
+    for required in ('--batch', '--smart', '--timeout=10', '--retries=1', '--threads=4'):
+        if required not in safe_flags:
+            safe_flags += f' {required}'
+    return await run_command(f'sqlmap -u "{url}" {safe_flags}', timeout=180)
 
 
 @tool(
@@ -57,8 +61,13 @@ async def hydra_brute(target: str, service: str, username: str, password: str, f
     user_flag = '-L' if os.path.isfile(username) else '-l'
     pass_flag = '-P' if os.path.isfile(password) else '-p'
 
-    cmd = f'hydra {user_flag} "{username}" {pass_flag} "{password}" {flags} {target} {service}'
-    return await run_command(cmd, timeout=300)
+    safe_flags = (flags or '').strip()
+    for required in ('-t 4', '-W 5', '-f'):
+        if required not in safe_flags:
+            safe_flags += f' {required}'
+
+    cmd = f'hydra {user_flag} "{username}" {pass_flag} "{password}" {safe_flags.strip()} {target} {service}'
+    return await run_command(cmd, timeout=90)
 
 
 @tool(

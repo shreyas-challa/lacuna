@@ -76,3 +76,23 @@ async def check_cron(command: str = '') -> str:
     if not command:
         return _SSHPASS_HINT
     return await run_command(command)
+
+
+@tool(
+    name='check_capabilities',
+    description='Check for Linux capabilities on the target (e.g. cap_setuid = instant root). '
+                'IMPORTANT: Command must use sshpass to run remotely, e.g.: '
+                "sshpass -p 'PASS' ssh -o StrictHostKeyChecking=no user@target 'getcap -r / 2>/dev/null'",
+    parameters={
+        'type': 'object',
+        'properties': {
+            'command': {'type': 'string', 'description': 'Full SSH command to check capabilities on target'},
+        },
+        'required': ['command'],
+    },
+    phases=['privesc'],
+)
+async def check_capabilities(command: str = '') -> str:
+    if not command:
+        return _SSHPASS_HINT
+    return await run_command(command)

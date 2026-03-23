@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import time
 import inspect
+import asyncio
 from pathlib import Path
 from datetime import datetime
 
@@ -27,6 +28,9 @@ from backend.ws_manager import WSManager
 from backend.state import StateManager
 from backend.context import build_messages
 from backend.knowledge import match_service_to_exploits, get_privesc_advice, REVERSE_SHELLS
+from backend.output_processing import OutputProcessor
+from backend.planning import Observation, Planner, WorkingMemory
+from backend.shell_sessions import ShellSessionManager, parse_sshpass_ssh_command
 from backend.tools import TOOL_REGISTRY, get_tools_for_phase
 from backend.tools.exploitation import set_lhost
 from backend.parsers import TOOL_PARSERS, STATE_EXTRACTORS
@@ -305,7 +309,11 @@ class Agent:
         self.graph = GraphManager()
         self.report = ReportBuilder(target)
         self.state = StateManager()
+        self.memory = WorkingMemory()
+        self.output_processor = OutputProcessor()
+        self.shell_sessions = ShellSessionManager()
         self.client = get_client()
+        self.planner = Planner(self.client, target)
         self.phase = 'enumeration'
         self.messages: list[dict] = []
         self.total_iterations = 0
@@ -345,6 +353,9 @@ class Agent:
         self._privesc_checks_done: set[str] = set()
         # Persistent per-phase budgets; do not reset when the outer loop re-enters the same phase
         self._phase_iterations_used: dict[str, int] = {phase: 0 for phase in PHASES}
+        self._plan_refresh_required: bool = True
+        self._last_state_fingerprint = self._state_fingerprint()
+        self._planner_calls: int = 0
 
     # ── System prompt construction ───────────────────────────────
     def _build_system_prompt(self) -> str:
@@ -363,6 +374,10 @@ class Agent:
         state_summary = self.state.get_prompt_summary()
         if state_summary:
             dynamic_parts.append(state_summary)
+
+        memory_summary = self.memory.get_prompt_summary()
+        if memory_summary:
+            dynamic_parts.append(memory_summary)
 
         knowledge = self._get_knowledge_hints()
         if knowledge:
@@ -408,6 +423,11 @@ class Agent:
     def _get_tool_suggestions(self) -> str:
         """Generate brief tool hints based on current state patterns."""
         suggestions = []
+        active_task = self.memory.current_plan.active_task() if self.memory.current_plan else None
+        if active_task and active_task.tool_hints:
+            suggestions.append(
+                f"PLAN FOCUS: {active_task.title} — prefer {', '.join(active_task.tool_hints[:4])}"
+            )
 
         # Web service found but not scanned
         web_ports = [svc for svc in self.state.services.values()
@@ -481,6 +501,132 @@ class Agent:
         if blocked:
             phase_tools = [t for t in phase_tools if t['function']['name'] not in blocked]
         return META_TOOLS + phase_tools
+
+    def _state_fingerprint(self) -> tuple:
+        return (
+            self.phase,
+            len(self.state.services),
+            len(self.state.credentials),
+            len(self.state.accesses),
+            len(self.state.findings),
+            len(self.state.loot),
+            tuple(sorted(key for key, value in self.state.workflow_markers.items() if value)),
+            len(self.state.hypotheses),
+            tuple(sorted(self.state.web_sessions.keys())),
+        )
+
+    def _request_plan_refresh(self):
+        self._plan_refresh_required = True
+
+    def _sync_plan_progress(self):
+        plan = self.memory.current_plan
+        if not plan:
+            return
+
+        if self.state.services:
+            plan.set_status('enum-services', 'done', evidence=f"{len(self.state.services)} services identified")
+        if self.state.web_assets['api_endpoints'] or self.state.web_assets['scripts'] or self.state.web_sessions:
+            plan.set_status('enum-web', 'done', evidence='Web workflow artifacts captured')
+
+        markers = self.state.workflow_markers
+        if markers.get('invite_code_obtained'):
+            plan.set_status('invite-howto', 'done', evidence=self.state.loot.get('invite_code', 'invite code recovered'))
+            if plan.get_task('invite-verify') and plan.get_task('invite-verify').status == 'pending':
+                plan.set_status('invite-verify', 'active')
+        if markers.get('invite_verified'):
+            plan.set_status('invite-verify', 'done', evidence='Invite verification succeeded')
+            if plan.get_task('invite-register') and plan.get_task('invite-register').status == 'pending':
+                plan.set_status('invite-register', 'active')
+        if markers.get('authenticated_session'):
+            plan.set_status('invite-register', 'done', evidence='Authenticated session established')
+
+        if self.state.credentials:
+            plan.set_status('idor-paths', 'done', evidence='Credentials recovered from web workflow')
+            if plan.get_task('test-creds') and plan.get_task('test-creds').status == 'pending':
+                plan.set_status('test-creds', 'active')
+        if any(cred.verified_for for cred in self.state.credentials.values()):
+            plan.set_status('test-creds', 'done', evidence='Credential verified on a service')
+        if self.state.accesses:
+            plan.set_status('test-creds', 'done', evidence='Shell access obtained')
+            plan.set_status('ssh-foothold', 'done', evidence='SSH foothold established')
+            if self.phase == 'privesc':
+                for task_id in ('privesc-sudo', 'privesc-caps', 'privesc-suid', 'privesc-cron'):
+                    task = plan.get_task(task_id)
+                    if task and task.status == 'pending':
+                        task.status = 'active'
+                        break
+
+        if 'check_sudo' in self._privesc_checks_done:
+            plan.set_status('privesc-sudo', 'done', evidence='sudo -l executed')
+        if 'check_capabilities' in self._privesc_checks_done or any('cap_setuid' in finding.title for finding in self.state.findings):
+            plan.set_status('privesc-caps', 'done', evidence='Capabilities checked')
+        if 'check_suid' in self._privesc_checks_done:
+            plan.set_status('privesc-suid', 'done', evidence='SUID enumeration complete')
+        if 'check_cron' in self._privesc_checks_done:
+            plan.set_status('privesc-cron', 'done', evidence='Cron enumeration complete')
+
+        if self.state.has_root(self.target):
+            plan.set_status('collect-root-flag', 'active', evidence='Root access confirmed')
+        if 'root_flag' in self.state.loot:
+            plan.set_status('collect-root-flag', 'done', evidence='Root flag collected')
+
+        plan.ensure_single_active()
+
+    async def _refresh_plan(self, reason: str = "", force: bool = False):
+        if not force and not self._plan_refresh_required:
+            return
+
+        self.memory.sync_from_state(self.state)
+        result = await self.planner.build_plan(
+            self.phase,
+            self.state.to_snapshot(),
+            self.memory.to_snapshot(),
+        )
+        self.memory.set_plan(result.plan, reason or result.source)
+        self._sync_plan_progress()
+        self._plan_refresh_required = False
+        self._last_state_fingerprint = self._state_fingerprint()
+
+        if result.usage:
+            self.total_input_tokens += result.usage.get('input', 0)
+            self.total_output_tokens += result.usage.get('output', 0)
+            self.total_cached_tokens += result.usage.get('cached', 0)
+            self.total_cost += result.usage.get('cost', 0.0)
+            self._planner_calls += 1
+
+        self._current_strategy = self.memory.current_plan.render_summary(limit=10)
+        await self.manager.broadcast('strategy_update', {
+            'strategy': self._current_strategy,
+            'phase': self.phase,
+        })
+        source = result.source
+        if result.error:
+            source = f"{source} (llm fallback: {result.error})"
+        self.logger.log(f"{C_CYAN}Planner refresh [{source}] {reason or 'state update'}{C_RESET}")
+
+    def _guard_plan_drift(self, name: str, args: dict) -> str | None:
+        plan = self.memory.current_plan
+        if not plan:
+            return None
+        task = plan.ensure_single_active()
+        if not task or not task.tool_hints:
+            return None
+
+        if name in {'transition_phase', 'append_report'} or name in task.tool_hints:
+            return None
+
+        noisy_tools = {'hydra_brute', 'gobuster_dir', 'ffuf_fuzz', 'nuclei_scan', 'nikto_scan', 'sqlmap_scan'}
+        strict_tasks = {
+            'invite-howto', 'invite-verify', 'invite-register',
+            'privesc-sudo', 'privesc-caps', 'privesc-suid', 'privesc-cron',
+        }
+        if task.id in strict_tasks and name in noisy_tools:
+            return (
+                f"[ERROR] Active plan task: {task.title}. "
+                f"Preferred tools: {', '.join(task.tool_hints)}. "
+                f"Success condition: {task.success_criteria}"
+            )
+        return None
 
     # ── Planning & Reflection (Reasoning Layer) ──────────────────
 
@@ -676,6 +822,7 @@ class Agent:
         if has_user and not has_root and self.phase in ('enumeration',):
             L.log(f"{C_MAGENTA}{C_BOLD}STRATEGY: User access detected — jumping to privesc{C_RESET}")
             self.phase = 'privesc'
+            self._request_plan_refresh()
             self._phase_entry_iteration = self.total_iterations
             self._phase_entry_node_count = len(self.graph.nodes)
             await self.manager.broadcast('phase_change', {'phase': self.phase})
@@ -688,6 +835,7 @@ class Agent:
         if (verified_creds or unverified_creds) and not has_user and self.phase == 'enumeration':
             L.log(f"{C_MAGENTA}{C_BOLD}STRATEGY: Credentials found — jumping to exploitation{C_RESET}")
             self.phase = 'exploitation'
+            self._request_plan_refresh()
             self._phase_entry_iteration = self.total_iterations
             self._phase_entry_node_count = len(self.graph.nodes)
             await self.manager.broadcast('phase_change', {'phase': self.phase})
@@ -701,6 +849,7 @@ class Agent:
                 if critical_matches:
                     L.log(f"{C_MAGENTA}{C_BOLD}STRATEGY: Critical exploit match for {svc.name} — jumping to exploitation{C_RESET}")
                     self.phase = 'exploitation'
+                    self._request_plan_refresh()
                     self._phase_entry_iteration = self.total_iterations
                     self._phase_entry_node_count = len(self.graph.nodes)
                     await self.manager.broadcast('phase_change', {'phase': self.phase})
@@ -978,6 +1127,7 @@ class Agent:
             'role': 'user',
             'content': f'Begin the authorized penetration test against target {self.target}. Start with enumeration.',
         })
+        await self._refresh_plan(reason='initial state', force=True)
 
         L.log(f"{C_MAGENTA}Phase: ENUMERATION{C_RESET}")
         self._phase_entry_iteration = 0
@@ -1012,6 +1162,7 @@ class Agent:
                     if next_phase == 'complete':
                         self._done = True
                         break
+                    self._request_plan_refresh()
                     self._phase_entry_iteration = self.total_iterations
                     self._phase_entry_node_count = len(self.graph.nodes)
                     await self.manager.broadcast('phase_change', {'phase': self.phase})
@@ -1026,6 +1177,7 @@ class Agent:
                 self.messages.append({'role': 'user', 'content': planning_msg, '_iteration': self._iteration_counter})
                 self._plan_injected_for_phase.add(self.phase)
                 L.log(f"{C_CYAN}Injected planning prompt for {self.phase}{C_RESET}")
+                self._request_plan_refresh()
 
             while phase_iterations < MAX_ITERATIONS_PER_PHASE and self.total_iterations < MAX_TOTAL_ITERATIONS:
                 self.total_iterations += 1
@@ -1089,6 +1241,7 @@ class Agent:
                 L.log(f"{C_DIM}--- Iteration {self.total_iterations}/{MAX_TOTAL_ITERATIONS} (phase: {phase_iterations}/{MAX_ITERATIONS_PER_PHASE}) ---{C_RESET}")
 
                 # ── Build context-managed message list ───────────
+                await self._refresh_plan(reason='iteration start')
                 system_prompt = self._build_system_prompt()
                 messages = build_messages(system_prompt, self.messages, self._iteration_counter)
                 tools = self._get_tools()
@@ -1151,6 +1304,17 @@ class Agent:
                     consecutive_stops += 1
                     L.log(f"{C_DIM}No tool calls (stop #{consecutive_stops}){C_RESET}")
 
+                    active_task = self.memory.current_plan.active_task() if self.memory.current_plan else None
+                    if consecutive_stops == 1 and active_task and active_task.status in ('active', 'pending'):
+                        focus_msg = (
+                            f"[SYSTEM] The active plan task is still unfinished: {active_task.title}.\n"
+                            f"Success condition: {active_task.success_criteria or 'Advance this task with one concrete tool call.'}\n"
+                            f"Respond with exactly one tool call that advances this task."
+                        )
+                        self.messages.append({'role': 'user', 'content': focus_msg, '_iteration': self._iteration_counter})
+                        L.log(f"{C_CYAN}Reinforcing active task: {active_task.title}{C_RESET}")
+                        continue
+
                     if consecutive_stops >= 2:
                         current_idx = PHASES.index(self.phase) if self.phase in PHASES else len(PHASES) - 1
                         # Don't auto-advance to exploitation/privesc without actionable intel
@@ -1177,6 +1341,7 @@ class Agent:
 
                         if current_idx < len(PHASES) - 1:
                             self.phase = PHASES[current_idx + 1]
+                            self._request_plan_refresh()
                             self._phase_entry_iteration = self.total_iterations
                             self._phase_entry_node_count = len(self.graph.nodes)
                             L.log(f"{C_MAGENTA}Auto-advancing to {self.phase.upper()}{C_RESET}")
@@ -1206,6 +1371,7 @@ class Agent:
                     args, sanitize_note = sanitize_tool_args(name, args, context=_sanitize_ctx)
                     if sanitize_note:
                         L.log(f"{C_YELLOW}Args sanitized for {name}: {sanitize_note}{C_RESET}")
+                    plan_drift_error = self._guard_plan_drift(name, args)
                     drift_error = self._guard_workflow_drift(name, args)
                     transition_error = self._guard_phase_transition(name, args)
 
@@ -1229,7 +1395,9 @@ class Agent:
                         await self._broadcast_budget()
                         tool_start = time.time()
                         # ── curl redirect check ──────────────
-                        if drift_error:
+                        if plan_drift_error:
+                            result = plan_drift_error
+                        elif drift_error:
                             result = drift_error
                         elif transition_error:
                             result = transition_error
@@ -1273,6 +1441,7 @@ class Agent:
                     if result.startswith('[ERROR]') or result.startswith('[TIMEOUT'):
                         self._tool_failures[name] = self._tool_failures.get(name, 0) + 1
                         self._phase_failure_count += 1
+                        self.memory.record_dead_end(f"{name}: {result.splitlines()[0][:180]}")
                         if self._tool_failures[name] >= 2:
                             L.log(f"{C_RED}Circuit breaker: {name} failed {self._tool_failures[name]}x — temporarily disabled{C_RESET}")
                     else:
@@ -1343,6 +1512,27 @@ class Agent:
                     if name in STATE_EXTRACTORS and not result.startswith('[ERROR]'):
                         STATE_EXTRACTORS[name](result, self.target, self.state)
 
+                    processed = self.output_processor.process(name, args, result, self.target)
+                    processed_summary = processed.summary
+                    if processed.notable:
+                        processed_summary += " " + " ".join(processed.notable[:2])
+                    self.memory.record_observation(
+                        Observation(
+                            tool_name=name,
+                            summary=processed_summary,
+                            significance=processed.significance,
+                            notable=processed.notable,
+                            follow_up=processed.follow_up,
+                            raw_ref=f"{name}:{args.get('url', args.get('command', ''))[:120]}",
+                        )
+                    )
+                    self.memory.sync_from_state(self.state)
+                    self._sync_plan_progress()
+                    new_fingerprint = self._state_fingerprint()
+                    if new_fingerprint != self._last_state_fingerprint or processed.significance in {'high', 'critical'}:
+                        self._request_plan_refresh()
+                        self._last_state_fingerprint = new_fingerprint
+
                     # ── Auto-detect and add hostnames to /etc/hosts ──
                     if name in ('nmap_scan', 'curl_request', 'execute_command') and not result.startswith('[ERROR]'):
                         await self._auto_add_hosts(result)
@@ -1387,6 +1577,7 @@ class Agent:
                             self.phase = next_phase
                             if next_phase == 'privesc':
                                 self._privesc_checks_done.clear()
+                            self._request_plan_refresh()
 
                         self._phase_entry_iteration = self.total_iterations
                         self._phase_entry_node_count = len(self.graph.nodes)
@@ -1418,7 +1609,7 @@ class Agent:
         L.header(f"\n{C_BOLD}{C_BLUE}{'='*60}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  COMPLETE{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Model: {get_active_model()} ({get_active_backend()}){C_RESET}")
-        L.header(f"{C_BOLD}{C_BLUE}  Iterations: {self.total_iterations} | Tool calls: {self._tool_call_count}{C_RESET}")
+        L.header(f"{C_BOLD}{C_BLUE}  Iterations: {self.total_iterations} | Tool calls: {self._tool_call_count} | Planner calls: {self._planner_calls}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Tokens: {self.total_input_tokens} in ({self.total_cached_tokens} cached) / {self.total_output_tokens} out{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Estimated cost: ${self.total_cost:.4f}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Graph: {len(self.graph.nodes)} nodes, {len(self.graph.edges)} edges{C_RESET}")
@@ -1430,6 +1621,7 @@ class Agent:
 
         await self.manager.broadcast('report_update', {'markdown': self.report.get_markdown()})
         await self.manager.broadcast('complete', {})
+        await self.shell_sessions.close_all()
         L.close()
 
     # ── curl redirect ────────────────────────────────────────────
@@ -1566,6 +1758,16 @@ class Agent:
             await self.manager.broadcast('report_update', {'markdown': self.report.get_markdown()})
             L.log(f"{C_CYAN}Report appended ({len(md)} chars){C_RESET}")
             return "Report section appended."
+
+        if name in {'execute_command', 'check_sudo', 'check_suid', 'check_cron', 'check_capabilities', 'run_linpeas'}:
+            command = str(args.get('command', '') or '').strip()
+            parsed = parse_sshpass_ssh_command(command) if command else None
+            if parsed:
+                spec, remote_command = parsed
+                if remote_command:
+                    timeout = 300 if name == 'run_linpeas' else 120
+                    result = await self.shell_sessions.execute(spec, remote_command, timeout=timeout)
+                    return f"[SESSION {spec.key}] {result}".strip()
 
         if name in TOOL_REGISTRY:
             func = TOOL_REGISTRY[name]['function']
