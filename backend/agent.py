@@ -21,21 +21,21 @@ import asyncio
 from pathlib import Path
 from datetime import datetime
 
-from backend.llm import get_client, chat_completion, extract_usage, get_active_model, get_active_backend
+from backend.llm import get_client, get_active_model, get_active_backend
+from backend.analyzer import Analyzer
 from backend.graph import GraphManager
+from backend.journal import RunJournal
+from backend.operator import Operator, OperatorTaskContext
 from backend.report import ReportBuilder
 from backend.ws_manager import WSManager
 from backend.state import StateManager
-from backend.context import build_messages
-from backend.knowledge import match_service_to_exploits, get_privesc_advice, REVERSE_SHELLS
+from backend.knowledge import match_service_to_exploits
 from backend.output_processing import OutputProcessor
-from backend.planning import Observation, Planner, WorkingMemory
+from backend.planning import Planner, WorkingMemory
 from backend.shell_sessions import ShellSessionManager, parse_sshpass_ssh_command
 from backend.tools import TOOL_REGISTRY, get_tools_for_phase
 from backend.tools.exploitation import set_lhost
-from backend.parsers import TOOL_PARSERS, STATE_EXTRACTORS
 
-PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
 PHASES = ['enumeration', 'exploitation', 'privesc']
@@ -147,13 +147,6 @@ TOOL_HINTS = {
     'hydra_brute': 'HINT: Verify the service is running and accessible. Try fewer credentials or a different protocol.',
     'wpscan': 'HINT: Ensure the target is running WordPress. Check the URL (usually /wp-login.php exists).',
 }
-
-
-def load_prompt(filename: str) -> str:
-    path = PROMPTS_DIR / filename
-    return path.read_text() if path.exists() else ""
-
-
 class SessionLogger:
     def __init__(self, target: str):
         LOGS_DIR.mkdir(exist_ok=True)
@@ -316,15 +309,17 @@ class Agent:
         self.state = StateManager()
         self.memory = WorkingMemory()
         self.output_processor = OutputProcessor()
+        self.analyzer = Analyzer(target, self.state, self.graph, self.output_processor)
         self.shell_sessions = ShellSessionManager()
         self.client = get_client()
         self.planner = Planner(self.client, target)
+        self.operator = Operator(self.client)
         self.phase = 'enumeration'
-        self.messages: list[dict] = []
         self.total_iterations = 0
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.logger = SessionLogger(target)
+        self.journal = RunJournal(target, LOGS_DIR)
         self._done = False
         self._tool_cache: dict[str, str] = {}
         self._tool_call_count = 0
@@ -361,47 +356,6 @@ class Agent:
         self._last_state_fingerprint = self._state_fingerprint()
         self._planner_calls: int = 0
 
-    # ── System prompt construction ───────────────────────────────
-    def _build_system_prompt(self) -> str:
-        # STATIC PREFIX
-        system = load_prompt("system.md")
-        lhost = f"\nLHOST: {self.lhost}" if self.lhost else ""
-        static = f"{system}\n\nTarget: {self.target}{lhost}"
-
-        # SEMI-STATIC — changes on phase transition
-        phase_prompt = load_prompt(f"{self.phase}.md")
-        semi_static = f"\n\n## Phase: {self.phase}\n{phase_prompt}"
-
-        # DYNAMIC — changes every iteration
-        dynamic_parts = []
-
-        state_summary = self.state.get_prompt_summary()
-        if state_summary:
-            dynamic_parts.append(state_summary)
-
-        memory_summary = self.memory.get_prompt_summary()
-        if memory_summary:
-            dynamic_parts.append(memory_summary)
-
-        knowledge = self._get_knowledge_hints()
-        if knowledge:
-            dynamic_parts.append(knowledge)
-
-        # Tool suggestions based on current state
-        suggestions = self._get_tool_suggestions()
-        if suggestions:
-            dynamic_parts.append(suggestions)
-
-        graph_brief = self.graph.get_brief_summary()
-        if graph_brief:
-            dynamic_parts.append(graph_brief)
-
-        budget_total = MAX_TOTAL_ITERATIONS
-        remaining = max(0, budget_total - self._tool_call_count)
-        dynamic_parts.append(f"Budget: {remaining}/{budget_total} calls left")
-
-        return static + semi_static + '\n\n' + '\n\n'.join(dynamic_parts)
-
     def _get_knowledge_hints(self) -> str:
         """Match discovered services against exploit knowledge base."""
         hints = []
@@ -422,17 +376,6 @@ class Agent:
                 self._knowledge_injected.add(svc_key)
         if hints:
             return "## Known Exploits Detected\n" + '\n'.join(hints)
-        return ""
-
-    def _get_tool_suggestions(self) -> str:
-        """Expose only current task guidance, not heuristic nudges."""
-        active_task = self.memory.current_plan.active_task() if self.memory.current_plan else None
-        if active_task and active_task.tool_hints:
-            return "## Operator Hints\n" + '\n'.join([
-                f"- Active task: {active_task.title}",
-                f"- Preferred tools: {', '.join(active_task.tool_hints[:4])}",
-                f"- Success condition: {active_task.success_criteria or 'Advance the task with one concrete action.'}",
-            ])
         return ""
 
     def _get_tools(self) -> list[dict]:
@@ -470,6 +413,27 @@ class Agent:
         if active_task and active_task.status in ('active', 'pending'):
             return base + reserve_left
         return base
+
+    def _build_operator_context(self):
+        active_task = self.memory.current_plan.ensure_single_active() if self.memory.current_plan else None
+        if not active_task:
+            return None
+        budget_remaining = max(0, MAX_TOTAL_ITERATIONS - self._tool_call_count)
+        return OperatorTaskContext(
+            phase=self.phase,
+            target=self.target,
+            lhost=self.lhost,
+            task_id=active_task.id,
+            task_title=active_task.title,
+            task_description=active_task.description,
+            success_criteria=active_task.success_criteria,
+            tool_hints=list(active_task.tool_hints),
+            budget_remaining=budget_remaining,
+            state_summary=self.state.get_prompt_summary(),
+            memory_summary=self.memory.get_prompt_summary(),
+            graph_summary=self.graph.get_brief_summary(),
+            knowledge_hints=self._get_knowledge_hints(),
+        )
 
     def _sync_plan_progress(self):
         plan = self.memory.current_plan
@@ -551,6 +515,14 @@ class Agent:
         await self.manager.broadcast('strategy_update', {
             'strategy': self._current_strategy,
             'phase': self.phase,
+        })
+        self.journal.write('plan_refresh', {
+            'phase': self.phase,
+            'reason': reason or result.source,
+            'source': result.source,
+            'error': result.error,
+            'plan': self.memory.current_plan.to_dict() if self.memory.current_plan else None,
+            'memory': self.memory.to_snapshot(),
         })
         source = result.source
         if result.error:
@@ -638,6 +610,7 @@ class Agent:
             self.phase = 'complete'
             self._done = True
             await self.manager.broadcast('phase_change', {'phase': 'complete'})
+            self.journal.write('phase_change', {'phase': 'complete', 'reason': 'root flag obtained'})
             return
 
         # User access + no root → jump to privesc
@@ -650,6 +623,7 @@ class Agent:
             self._phase_entry_iteration = self.total_iterations
             self._phase_entry_node_count = len(self.graph.nodes)
             await self.manager.broadcast('phase_change', {'phase': self.phase})
+            self.journal.write('phase_change', {'phase': self.phase, 'reason': 'user access detected'})
             return
 
         # Verified creds + no access → jump to exploitation
@@ -663,6 +637,7 @@ class Agent:
             self._phase_entry_iteration = self.total_iterations
             self._phase_entry_node_count = len(self.graph.nodes)
             await self.manager.broadcast('phase_change', {'phase': self.phase})
+            self.journal.write('phase_change', {'phase': self.phase, 'reason': 'credentials discovered'})
             return
 
         # Critical KB exploit match during enumeration → jump to exploitation
@@ -677,6 +652,7 @@ class Agent:
                     self._phase_entry_iteration = self.total_iterations
                     self._phase_entry_node_count = len(self.graph.nodes)
                     await self.manager.broadcast('phase_change', {'phase': self.phase})
+                    self.journal.write('phase_change', {'phase': self.phase, 'reason': f'critical exploit match for {svc.name}'})
                     return
 
         if self.phase != old_phase:
@@ -728,6 +704,13 @@ class Agent:
                 'ssh_command': ssh_cmd,
                 'timestamp': time.strftime('%H:%M:%S'),
             })
+            self.journal.write('shell_access', {
+                'host': access.host,
+                'user': access.user,
+                'level': access.level,
+                'method': access.method,
+                'ssh_command': ssh_cmd,
+            })
 
             # Attempt to spawn a local terminal
             if ssh_cmd and self._terminal and password:
@@ -746,18 +729,9 @@ class Agent:
 
     # ── Auto /etc/hosts management ─────────────────────────────
 
-    async def _auto_add_hosts(self, output: str):
-        """Detect hostnames in tool output and add them to /etc/hosts."""
+    async def _auto_add_hosts(self, hostnames: list[str]):
+        """Add discovered target hostnames to /etc/hosts."""
         L = self.logger
-        # Match patterns like "redirect to http://hostname.tld" or "Did not follow redirect to http://hostname.htb"
-        hostnames = set()
-        for m in re.finditer(r'https?://([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,})', output):
-            hostname = m.group(1).lower()
-            # Skip common non-target hostnames
-            if any(hostname.endswith(skip) for skip in ('.com', '.org', '.net', '.io', '.dev', '.gov')):
-                continue
-            hostnames.add(hostname)
-
         for hostname in hostnames:
             if hostname in self._hosts_added:
                 continue
@@ -784,136 +758,6 @@ class Agent:
                     L.log(f"{C_CYAN}Auto-added to /etc/hosts: {self.target} {hostname}{C_RESET}")
             except Exception:
                 pass
-
-    # ── Auto web asset extraction ────────────────────────────────
-
-    def _auto_extract_web_assets(self, result: str):
-        """Extract web asset references from HTML/JS tool output into state."""
-        L = self.logger
-        added = 0
-
-        # Script tags: <script src="...">
-        for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', result, re.IGNORECASE):
-            if self.state.add_web_asset('scripts', m.group(1)):
-                added += 1
-
-        # Link tags (CSS/JS): <link ... href="...">
-        for m in re.finditer(r'<link[^>]+href=["\']([^"\']+)["\']', result, re.IGNORECASE):
-            href = m.group(1)
-            if href.endswith(('.css', '.js')):
-                cat = 'stylesheets' if href.endswith('.css') else 'scripts'
-                if self.state.add_web_asset(cat, href):
-                    added += 1
-
-        # Form actions: <form ... action="...">
-        for m in re.finditer(r'<form[^>]+action=["\']([^"\']*)["\']', result, re.IGNORECASE):
-            action = m.group(1)
-            if action and action != '#':
-                if self.state.add_web_asset('forms', action):
-                    added += 1
-
-        # API endpoints in JS/HTML: paths like /api/...
-        for m in re.finditer(r'["\'](/api/[^"\'?\s]{3,})["\']', result):
-            if self.state.add_web_asset('api_endpoints', m.group(1)):
-                added += 1
-
-        # fetch/ajax/post/get URL patterns
-        for m in re.finditer(r'(?:fetch|ajax|post|get|put|delete)\s*\(\s*["\'](/[^"\'?\s]{3,})["\']', result, re.IGNORECASE):
-            if self.state.add_web_asset('api_endpoints', m.group(1)):
-                added += 1
-
-        # Anchor hrefs with download/file/export paths (catch /download/N, /file/X, etc.)
-        for m in re.finditer(r'href=["\']([^"\']*(?:/download/|/file/|/export/|/raw/|/pcap/|\.pcap)[^"\']*)["\']', result, re.IGNORECASE):
-            link = m.group(1)
-            if link and link != '#':
-                if self.state.add_web_asset('api_endpoints', link):
-                    added += 1
-
-        if added:
-            L.log(f"{C_CYAN}Auto-extracted {added} web asset(s) into state{C_RESET}")
-
-    # ── IDOR pattern detection ──────────────────────────────────
-
-    # Common sibling path patterns for IDOR detection
-    _IDOR_SIBLING_PATHS = {
-        '/data/': ['/download/', '/export/', '/file/', '/raw/'],
-        '/download/': ['/data/', '/view/', '/file/'],
-        '/view/': ['/download/', '/data/', '/raw/'],
-        '/file/': ['/download/', '/data/'],
-        '/capture/': ['/download/', '/data/', '/pcap/'],
-        '/report/': ['/download/', '/export/'],
-        '/export/': ['/download/', '/data/'],
-        '/user/': ['/profile/', '/account/'],
-        '/profile/': ['/user/', '/account/'],
-    }
-
-    def _check_idor_pattern(self, url: str, result: str):
-        """Detect numeric ID patterns and persist them as plan-relevant state."""
-        L = self.logger
-        # Match URLs like /data/1, /download/2, /user/3, /api/items/5, etc.
-        m = re.search(r'(https?://[^/]+)?(/[^?#\s]*?/)(\d+)(?:[?#\s]|$)', url)
-        if not m:
-            return
-        base_path = m.group(2)
-        current_id = int(m.group(3))
-
-        # Only fire once per base path
-        idor_key = f"_idor_nudge_{base_path}"
-        if hasattr(self, idor_key):
-            return
-        setattr(self, idor_key, True)
-
-        host_prefix = m.group(1) or ''
-
-        # Build suggestion list: always try 0, and try adjacent IDs
-        try_ids = set()
-        if current_id != 0:
-            try_ids.add(0)
-        if current_id > 1:
-            try_ids.add(current_id - 1)
-        try_ids.add(current_id + 1)
-        try_ids.discard(current_id)
-
-        # Build sibling path suggestions
-        sibling_suggestions = []
-        for pattern, siblings in self._IDOR_SIBLING_PATHS.items():
-            if base_path == pattern:
-                for sibling in siblings:
-                    sibling_suggestions.append(f"{host_prefix}{sibling}{current_id}")
-                    if current_id != 0:
-                        sibling_suggestions.append(f"{host_prefix}{sibling}0")
-                break
-
-        note_parts = [
-            f"Potential IDOR observed at {url} with numeric object id {current_id}."
-        ]
-
-        if try_ids:
-            id_urls = ', '.join(f'{host_prefix}{base_path}{i}' for i in sorted(try_ids))
-            note_parts.append(f"Candidate adjacent object IDs: {id_urls}.")
-
-        if sibling_suggestions:
-            note_parts.append(f"Sibling endpoints worth testing: {', '.join(sibling_suggestions[:6])}.")
-
-        # Also extract any download/file links from the HTML result
-        download_links = set()
-        for dm in re.finditer(r'href=["\']([^"\']*(?:download|file|export|raw|pcap)[^"\']*)["\']', result, re.IGNORECASE):
-            link = dm.group(1)
-            if link and link != '#':
-                download_links.add(link)
-        if download_links:
-            note_parts.append(f"Download links seen: {', '.join(sorted(download_links)[:5])}.")
-
-        for note in note_parts:
-            self.state.add_note(note)
-        self.state.upsert_hypothesis(
-            f'idor:{base_path}',
-            f'Numeric endpoint family {base_path}<id> may expose insecure direct object references.',
-            status='active',
-            evidence=', '.join(sorted(download_links)[:3]) or f'Observed {url}',
-        )
-        self._request_plan_refresh()
-        L.log(f"{C_CYAN}IDOR pattern persisted to state: {base_path}{current_id}{C_RESET}")
 
     # ── Budget broadcasting ──────────────────────────────────────
 
@@ -946,12 +790,8 @@ class Agent:
         await self._broadcast_graph()
         await self.manager.broadcast('phase_change', {'phase': self.phase})
         await self._broadcast_budget()
-
-        self.messages.append({
-            'role': 'user',
-            'content': f'Begin the authorized penetration test against target {self.target}. Start with enumeration.',
-        })
         await self._refresh_plan(reason='initial state', force=True)
+        self.journal.write('phase_change', {'phase': self.phase, 'reason': 'initial state'})
 
         L.log(f"{C_MAGENTA}Phase: ENUMERATION{C_RESET}")
         self._phase_entry_iteration = 0
@@ -1066,25 +906,43 @@ class Agent:
 
                 L.log(f"{C_DIM}--- Iteration {self.total_iterations}/{MAX_TOTAL_ITERATIONS} (phase: {phase_iterations}/{self._phase_budget_limit(self.phase)}) ---{C_RESET}")
 
-                # ── Build context-managed message list ───────────
                 await self._refresh_plan(reason='iteration start')
-                system_prompt = self._build_system_prompt()
-                messages = build_messages(system_prompt, self.messages, self._iteration_counter)
-                tools = self._get_tools()
+                operator_context = self._build_operator_context()
+                if not operator_context:
+                    self._request_plan_refresh()
+                    self.memory.record_dead_end("Planner returned no active task; requesting replanning.")
+                    continue
 
-                L.log(f"{C_CYAN}Calling LLM ({len(messages)} messages, {len(tools)} tools)...{C_RESET}")
-                llm_start = time.time()
+                tools = self._get_tools()
+                if operator_context.task_id != self.operator.current_task_id:
+                    self.journal.write('task_activate', {
+                        'phase': self.phase,
+                        'task_id': operator_context.task_id,
+                        'task_title': operator_context.task_title,
+                        'success_criteria': operator_context.success_criteria,
+                        'tool_hints': operator_context.tool_hints,
+                    })
+
+                L.log(f"{C_CYAN}Operator call ({operator_context.task_id}, {len(tools)} tools)...{C_RESET}")
+                operator_start = time.time()
 
                 try:
-                    response = await chat_completion(self.client, messages, tools)
+                    turn = await self.operator.next_turn(operator_context, tools)
                 except Exception as e:
                     L.log(f"{C_RED}LLM ERROR: {e}{C_RESET}")
                     await self.manager.broadcast('error', {'message': f"LLM error: {str(e)}"})
+                    self.journal.write('operator_error', {
+                        'phase': self.phase,
+                        'task_id': operator_context.task_id,
+                        'error': str(e),
+                    })
+                    await self.shell_sessions.close_all()
+                    self.journal.close()
                     L.close()
                     return
 
-                llm_time = time.time() - llm_start
-                usage_info = extract_usage(response)
+                llm_time = time.time() - operator_start
+                usage_info = turn.usage
                 self.total_input_tokens += usage_info['input']
                 self.total_output_tokens += usage_info['output']
                 self.total_cached_tokens += usage_info['cached']
@@ -1093,28 +951,27 @@ class Agent:
                     cached_pct = f" ({usage_info['cached']} cached)" if usage_info['cached'] else ""
                     L.log(f"{C_DIM}LLM: {llm_time:.1f}s | {usage_info['input']}{cached_pct}/{usage_info['output']} tokens | ${usage_info['cost']:.4f} (total: ${self.total_cost:.4f}){C_RESET}")
 
-                choice = response.choices[0]
+                choice = turn.response.choices[0]
                 message = choice.message
 
                 if message.content:
                     text = message.content[:200] + ('...' if len(message.content) > 200 else '')
                     L.log(f"{C_YELLOW}Thinking: {text}{C_RESET}")
                     await self.manager.broadcast('agent_thinking', {'text': message.content})
-
-                assistant_msg = {'role': 'assistant', 'content': message.content or '', '_iteration': self._iteration_counter}
-                if message.tool_calls:
-                    assistant_msg['tool_calls'] = [
+                self.journal.write('operator_turn', {
+                    'phase': self.phase,
+                    'task_id': operator_context.task_id,
+                    'content': message.content or '',
+                    'tool_calls': [
                         {
                             'id': tc.id,
-                            'type': 'function',
-                            'function': {
-                                'name': tc.function.name,
-                                'arguments': tc.function.arguments,
-                            },
+                            'name': tc.function.name,
+                            'arguments': tc.function.arguments,
                         }
-                        for tc in message.tool_calls
-                    ]
-                self.messages.append(assistant_msg)
+                        for tc in (message.tool_calls or [])
+                    ],
+                    'usage': usage_info,
+                })
 
                 # ── No tool calls → model is done with phase ─────
                 if not message.tool_calls:
@@ -1127,6 +984,7 @@ class Agent:
                         self.memory.record_dead_end(
                             f"Operator returned no tool calls while task remained open: {active_task.title}"
                         )
+                        self.operator.mark_task_blocked(active_task.title)
                         self._request_plan_refresh()
                         L.log(f"{C_CYAN}Blocked task after no-tool response: {active_task.title}{C_RESET}")
                         continue
@@ -1188,6 +1046,12 @@ class Agent:
                         args_short = args_short[:150] + '...'
                     L.log(f"{C_GREEN}Tool: {C_BOLD}{name}{C_RESET}{C_GREEN} | {args_short}{C_RESET}")
                     await self.manager.broadcast('tool_call', {'id': call_id, 'name': name, 'args': args})
+                    self.journal.write('tool_call', {
+                        'phase': self.phase,
+                        'task_id': operator_context.task_id,
+                        'tool_name': name,
+                        'args': args,
+                    })
 
                     # ── Cache check ──────────────────────────────
                     cache_key = f"{name}|{json.dumps(args, sort_keys=True)}"
@@ -1241,6 +1105,13 @@ class Agent:
 
                     result_lines = result.count('\n') + 1
                     L.log(f"{C_GREEN}Done: {name} | {tool_time:.1f}s | {len(result)} chars, {result_lines} lines{C_RESET}")
+                    self.operator.record_tool_result(call_id, result)
+                    self.journal.write('tool_result', {
+                        'phase': self.phase,
+                        'task_id': operator_context.task_id,
+                        'tool_name': name,
+                        'result': result[:4000],
+                    })
 
                     # Circuit breaker: track consecutive failures per tool
                     if result.startswith('[ERROR]') or result.startswith('[TIMEOUT'):
@@ -1288,56 +1159,32 @@ class Agent:
                                 L.log(f"{C_RED}Repetition detector: {tf_clean} analyzed {self._file_analysis_count[tf_clean]}x — planner refresh requested{C_RESET}")
                                 break
 
-                    # ── Auto-update graph ────────────────────────
-                    parsed = None
-                    if name in TOOL_PARSERS and not result.startswith('[ERROR]') and not result.startswith('[TIMEOUT'):
-                        parsed = TOOL_PARSERS[name](result, self.target)
-                    elif name in ('execute_command', 'download_and_analyze') and not result.startswith('[ERROR]'):
-                        parsed = _parse_command_output_for_graph(result, self.target)
-
-                    if parsed and (parsed['nodes'] or parsed['edges']):
-                        self.graph.update_from_args(parsed)
-                        await self._broadcast_graph()
-                        L.log(f"{C_BLUE}Graph: +{len(parsed['nodes'])} nodes, +{len(parsed['edges'])} edges{C_RESET}")
-
-                    # ── Feed state extractors ────────────────────
-                    if name in STATE_EXTRACTORS and not result.startswith('[ERROR]'):
-                        STATE_EXTRACTORS[name](result, self.target, self.state)
-
-                    processed = self.output_processor.process(name, args, result, self.target)
-                    processed_summary = processed.summary
-                    if processed.notable:
-                        processed_summary += " " + " ".join(processed.notable[:2])
-                    self.memory.record_observation(
-                        Observation(
-                            tool_name=name,
-                            summary=processed_summary,
-                            significance=processed.significance,
-                            notable=processed.notable,
-                            follow_up=processed.follow_up,
-                            raw_ref=f"{name}:{args.get('url', args.get('command', ''))[:120]}",
-                        )
-                    )
+                    analysis = self.analyzer.analyze(name, args, result)
+                    self.memory.record_observation(analysis.observation)
                     self.memory.sync_from_state(self.state)
                     self._sync_plan_progress()
+                    if analysis.graph_nodes_added or analysis.graph_edges_added:
+                        await self._broadcast_graph()
+                        L.log(f"{C_BLUE}Graph: +{analysis.graph_nodes_added} nodes, +{analysis.graph_edges_added} edges{C_RESET}")
+                    if analysis.discovered_hosts:
+                        await self._auto_add_hosts(analysis.discovered_hosts)
+                    if analysis.web_assets_added:
+                        L.log(f"{C_CYAN}Analyzer extracted {analysis.web_assets_added} web asset(s){C_RESET}")
                     new_fingerprint = self._state_fingerprint()
-                    if new_fingerprint != self._last_state_fingerprint or processed.significance in {'high', 'critical'}:
+                    if new_fingerprint != self._last_state_fingerprint or analysis.plan_refresh_required:
                         self._request_plan_refresh()
                         self._last_state_fingerprint = new_fingerprint
-
-                    # ── Auto-detect and add hostnames to /etc/hosts ──
-                    if name in ('nmap_scan', 'curl_request', 'execute_command') and not result.startswith('[ERROR]'):
-                        await self._auto_add_hosts(result)
-
-                    # ── Auto-extract web assets from HTML/JS output ──
-                    if name in ('curl_request', 'execute_command', 'download_and_analyze') and not result.startswith('[ERROR]'):
-                        self._auto_extract_web_assets(result)
-
-                    # ── IDOR pattern detection for numeric URL IDs ──
-                    if name in ('curl_request', 'download_and_analyze') and not result.startswith('[ERROR]'):
-                        url_arg = args.get('url', '')
-                        if url_arg:
-                            self._check_idor_pattern(url_arg, result)
+                    self.journal.write('analysis', {
+                        'phase': self.phase,
+                        'task_id': operator_context.task_id,
+                        'tool_name': name,
+                        'observation': analysis.observation.to_dict(),
+                        'graph_nodes_added': analysis.graph_nodes_added,
+                        'graph_edges_added': analysis.graph_edges_added,
+                        'discovered_hosts': analysis.discovered_hosts,
+                        'web_assets_added': analysis.web_assets_added,
+                        'plan_refresh_required': analysis.plan_refresh_required,
+                    })
 
                     # ── Check for new shell access ───────────────
                     await self._check_new_access()
@@ -1348,12 +1195,6 @@ class Agent:
                         should_break = True
 
                     await self.manager.broadcast('tool_result', {'id': call_id, 'result': result, 'error': False})
-                    self.messages.append({
-                        'role': 'tool',
-                        'tool_call_id': call_id,
-                        'content': result,
-                        '_iteration': self._iteration_counter,
-                    })
 
                     # ── Phase transition ─────────────────────────
                     if name == 'transition_phase' and not result.startswith('[ERROR]'):
@@ -1379,22 +1220,21 @@ class Agent:
                         L.log(f"{C_MAGENTA}Reason: {args.get('reason', 'N/A')}{C_RESET}")
                         L.log(f"{C_MAGENTA}{'='*40}{C_RESET}\n")
                         await self.manager.broadcast('phase_change', {'phase': self.phase})
+                        self.journal.write('phase_change', {
+                            'phase': self.phase,
+                            'reason': args.get('reason', 'N/A'),
+                        })
                         await self._broadcast_budget()
                         should_break = True
 
                 if should_break:
-                    # Append placeholder results for any remaining tool calls
-                    # MiniMax requires every tool_call to have a corresponding tool result
-                    processed_ids = {m['tool_call_id'] for m in self.messages
-                                     if m.get('role') == 'tool' and m.get('tool_call_id')}
                     for remaining_tc in message.tool_calls:
-                        if remaining_tc.id not in processed_ids:
-                            self.messages.append({
-                                'role': 'tool',
-                                'tool_call_id': remaining_tc.id,
-                                'content': '[SKIPPED — phase transition or completion in progress]',
-                                '_iteration': self._iteration_counter,
-                            })
+                        if remaining_tc.id == call_id:
+                            continue
+                        self.operator.record_placeholder_result(
+                            remaining_tc.id,
+                            '[SKIPPED — phase transition or completion in progress]',
+                        )
                     break
 
         # ── Final summary ────────────────────────────────────────
@@ -1414,6 +1254,7 @@ class Agent:
         await self.manager.broadcast('report_update', {'markdown': self.report.get_markdown()})
         await self.manager.broadcast('complete', {})
         await self.shell_sessions.close_all()
+        self.journal.close()
         L.close()
 
     # ── curl redirect ────────────────────────────────────────────
