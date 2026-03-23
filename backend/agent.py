@@ -39,8 +39,13 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
 PHASES = ['enumeration', 'exploitation', 'privesc']
-MAX_ITERATIONS_PER_PHASE = 40
-MAX_TOTAL_ITERATIONS = 150
+PHASE_BASE_BUDGETS = {
+    'enumeration': 20,
+    'exploitation': 40,
+    'privesc': 15,
+}
+RESERVE_ITERATIONS = 30
+MAX_TOTAL_ITERATIONS = sum(PHASE_BASE_BUDGETS.values()) + RESERVE_ITERATIONS
 
 # ── Terminal colors ──────────────────────────────────────────────
 C_RESET = '\033[0m'
@@ -518,6 +523,18 @@ class Agent:
     def _request_plan_refresh(self):
         self._plan_refresh_required = True
 
+    def _phase_budget_limit(self, phase: str) -> int:
+        base = PHASE_BASE_BUDGETS.get(phase, 20)
+        reserve_used = sum(
+            max(0, used - PHASE_BASE_BUDGETS.get(name, 20))
+            for name, used in self._phase_iterations_used.items()
+        )
+        reserve_left = max(0, RESERVE_ITERATIONS - reserve_used)
+        active_task = self.memory.current_plan.ensure_single_active() if self.memory.current_plan else None
+        if active_task and active_task.status in ('active', 'pending'):
+            return base + reserve_left
+        return base
+
     def _sync_plan_progress(self):
         plan = self.memory.current_plan
         if not plan:
@@ -714,6 +731,8 @@ class Agent:
 
     def _guard_workflow_drift(self, name: str, args: dict) -> str | None:
         """Block broad scanning when a finite web workflow is already dominant."""
+        if self.memory.current_plan and self.memory.current_plan.ensure_single_active():
+            return None
         invite_hypothesis = self.state.hypotheses.get('invite_workflow')
         if not invite_hypothesis or invite_hypothesis.status not in ('active', 'validated'):
             return None
@@ -1024,10 +1043,7 @@ class Agent:
     }
 
     def _check_idor_pattern(self, url: str, result: str):
-        """Detect numeric ID patterns in URLs and suggest trying other IDs (especially 0).
-
-        Also suggests common sibling paths (e.g. /download/N when /data/N is found).
-        """
+        """Detect numeric ID patterns and persist them as plan-relevant state."""
         L = self.logger
         # Match URLs like /data/1, /download/2, /user/3, /api/items/5, etc.
         m = re.search(r'(https?://[^/]+)?(/[^?#\s]*?/)(\d+)(?:[?#\s]|$)', url)
@@ -1063,20 +1079,16 @@ class Agent:
                         sibling_suggestions.append(f"{host_prefix}{sibling}0")
                 break
 
-        nudge_parts = [
-            f"[SYSTEM] The URL {url} contains a numeric ID ({current_id}). "
-            f"This is a potential IDOR (Insecure Direct Object Reference)."
+        note_parts = [
+            f"Potential IDOR observed at {url} with numeric object id {current_id}."
         ]
 
         if try_ids:
             id_urls = ', '.join(f'{host_prefix}{base_path}{i}' for i in sorted(try_ids))
-            nudge_parts.append(f"Try other IDs: {id_urls}. ID 0 often contains pre-existing data from other users.")
+            note_parts.append(f"Candidate adjacent object IDs: {id_urls}.")
 
         if sibling_suggestions:
-            nudge_parts.append(
-                f"Also try related endpoints: {', '.join(sibling_suggestions[:6])}. "
-                f"Web apps often have separate /data/ (view) and /download/ (file) endpoints."
-            )
+            note_parts.append(f"Sibling endpoints worth testing: {', '.join(sibling_suggestions[:6])}.")
 
         # Also extract any download/file links from the HTML result
         download_links = set()
@@ -1085,11 +1097,18 @@ class Agent:
             if link and link != '#':
                 download_links.add(link)
         if download_links:
-            nudge_parts.append(f"Found download links in page: {', '.join(sorted(download_links)[:5])}")
+            note_parts.append(f"Download links seen: {', '.join(sorted(download_links)[:5])}.")
 
-        nudge = '\n'.join(nudge_parts)
-        self.messages.append({'role': 'user', 'content': nudge, '_iteration': self._iteration_counter})
-        L.log(f"{C_CYAN}IDOR pattern detected: {base_path}{current_id} → IDs: {sorted(try_ids)}, siblings: {sibling_suggestions[:4]}{C_RESET}")
+        for note in note_parts:
+            self.state.add_note(note)
+        self.state.upsert_hypothesis(
+            f'idor:{base_path}',
+            f'Numeric endpoint family {base_path}<id> may expose insecure direct object references.',
+            status='active',
+            evidence=', '.join(sorted(download_links)[:3]) or f'Observed {url}',
+        )
+        self._request_plan_refresh()
+        L.log(f"{C_CYAN}IDOR pattern persisted to state: {base_path}{current_id}{C_RESET}")
 
     # ── Budget broadcasting ──────────────────────────────────────
 
@@ -1135,11 +1154,12 @@ class Agent:
 
         while self.phase != 'complete' and self.total_iterations < MAX_TOTAL_ITERATIONS and not self._done:
             phase_iterations = self._phase_iterations_used.get(self.phase, 0)
-            if phase_iterations >= MAX_ITERATIONS_PER_PHASE:
+            phase_budget_limit = self._phase_budget_limit(self.phase)
+            if phase_iterations >= phase_budget_limit:
                 await self._evaluate_strategy()
                 if self.phase == 'complete' or self._done:
                     break
-                if self._phase_iterations_used.get(self.phase, 0) >= MAX_ITERATIONS_PER_PHASE:
+                if self._phase_iterations_used.get(self.phase, 0) >= self._phase_budget_limit(self.phase):
                     exhausted_phase = self.phase
                     next_phase = 'complete'
                     if exhausted_phase == 'enumeration':
@@ -1156,7 +1176,7 @@ class Agent:
 
                     L.log(
                         f"{C_YELLOW}Phase budget exhausted for {exhausted_phase} "
-                        f"({phase_iterations}/{MAX_ITERATIONS_PER_PHASE}) -> {next_phase}{C_RESET}"
+                        f"({phase_iterations}/{phase_budget_limit}) -> {next_phase}{C_RESET}"
                     )
                     self.phase = next_phase
                     if next_phase == 'complete':
@@ -1171,15 +1191,12 @@ class Agent:
             consecutive_stops = 0
             self._phase_failure_count = 0
 
-            # ── Planning injection at phase entry ─────────────
             if self.phase not in self._plan_injected_for_phase and self.total_iterations > 0:
-                planning_msg = self._inject_planning_prompt()
-                self.messages.append({'role': 'user', 'content': planning_msg, '_iteration': self._iteration_counter})
                 self._plan_injected_for_phase.add(self.phase)
-                L.log(f"{C_CYAN}Injected planning prompt for {self.phase}{C_RESET}")
                 self._request_plan_refresh()
+                L.log(f"{C_CYAN}Refreshing task tree for phase entry: {self.phase}{C_RESET}")
 
-            while phase_iterations < MAX_ITERATIONS_PER_PHASE and self.total_iterations < MAX_TOTAL_ITERATIONS:
+            while phase_iterations < self._phase_budget_limit(self.phase) and self.total_iterations < MAX_TOTAL_ITERATIONS:
                 self.total_iterations += 1
                 self._iteration_counter += 1
                 phase_iterations += 1
@@ -1210,7 +1227,12 @@ class Agent:
                         self._done = True
                         break
 
-                if iters_in_phase > 8 and new_nodes == 0 and iterations_since_nudge >= 5:
+                if (
+                    iters_in_phase > 8
+                    and new_nodes == 0
+                    and iterations_since_nudge >= 5
+                    and not (self.memory.current_plan and self.memory.current_plan.ensure_single_active())
+                ):
                     nudge = (
                         f"[SYSTEM] You have been in the '{self.phase}' phase for {iters_in_phase} iterations "
                         f"without discovering new information. You MUST take action NOW:\n"
@@ -1223,13 +1245,20 @@ class Agent:
                     L.log(f"{C_YELLOW}Stagnation nudge (iter {iters_in_phase}, 0 new nodes){C_RESET}")
 
                 # ── Reflection injection after failures ──────────
-                if (self._phase_failure_count >= 2 and
-                        self.total_iterations - self._reflection_injected_at > 3):
-                    reflection_msg = self._inject_reflection_prompt(self._phase_failure_count)
-                    self.messages.append({'role': 'user', 'content': reflection_msg, '_iteration': self._iteration_counter})
+                if (
+                    self._phase_failure_count >= 2 and
+                    self.total_iterations - self._reflection_injected_at > 3
+                ):
+                    self._request_plan_refresh()
                     self._reflection_injected_at = self.total_iterations
+                    if self.memory.current_plan and self.memory.current_plan.ensure_single_active():
+                        L.log(f"{C_YELLOW}Planner refresh after repeated failures{C_RESET}")
+                    else:
+                        reflection_msg = self._inject_reflection_prompt(self._phase_failure_count)
+                        self.messages.append({'role': 'user', 'content': reflection_msg, '_iteration': self._iteration_counter})
                     self._phase_failure_count = 0
-                    L.log(f"{C_YELLOW}Injected reflection prompt after {self._phase_failure_count} failures{C_RESET}")
+                    if not (self.memory.current_plan and self.memory.current_plan.ensure_single_active()):
+                        L.log(f"{C_YELLOW}Injected reflection prompt after repeated failures{C_RESET}")
 
                 # ── Auto-complete if root flag found ─────────────
                 if self.state.has_root(self.target) and 'root_flag' in self.state.loot:
@@ -1238,7 +1267,7 @@ class Agent:
                     self._done = True
                     break
 
-                L.log(f"{C_DIM}--- Iteration {self.total_iterations}/{MAX_TOTAL_ITERATIONS} (phase: {phase_iterations}/{MAX_ITERATIONS_PER_PHASE}) ---{C_RESET}")
+                L.log(f"{C_DIM}--- Iteration {self.total_iterations}/{MAX_TOTAL_ITERATIONS} (phase: {phase_iterations}/{self._phase_budget_limit(self.phase)}) ---{C_RESET}")
 
                 # ── Build context-managed message list ───────────
                 await self._refresh_plan(reason='iteration start')
@@ -1459,21 +1488,12 @@ class Agent:
                     if _is_waste:
                         self._consecutive_waste += 1
                         if self._consecutive_waste >= 5:
-                            waste_nudge = (
-                                "[SYSTEM] You have wasted the last 5+ tool calls on blocked/cached/useless commands. "
-                                "STOP using execute_command for local tasks. Instead:\n"
-                                "- Use curl_request to interact with the target web app\n"
-                                "- Use ffuf_fuzz to discover new endpoints or parameters\n"
-                                "- Use gobuster_dir for directory brute-forcing\n"
-                                "- Use nmap_scan with different flags (e.g. -p- for all ports, or UDP scan)\n"
-                                "- Use query_kb to look up exploits for discovered services\n"
-                                "- Check the 'Discovered Web Assets' section for JS/CSS files to fetch\n"
-                                "- Call transition_phase if you have exhausted this phase\n"
-                                "Prefer dedicated tools. In privesc, finish check_sudo/check_capabilities/check_suid/check_cron before exploit attempts."
+                            self.memory.record_dead_end(
+                                f"Five consecutive low-value actions occurred during {self.phase}; replan around a different surface."
                             )
-                            self.messages.append({'role': 'user', 'content': waste_nudge, '_iteration': self._iteration_counter})
+                            self._request_plan_refresh()
                             self._consecutive_waste = 0
-                            L.log(f"{C_RED}Waste detector: 5+ consecutive wasted calls — injecting corrective prompt{C_RESET}")
+                            L.log(f"{C_RED}Waste detector: 5+ consecutive wasted calls — triggering planner refresh{C_RESET}")
                     else:
                         self._consecutive_waste = 0
 
@@ -1485,15 +1505,11 @@ class Agent:
                             tf_clean = tf.rstrip("'\"`;|&)")
                             self._file_analysis_count[tf_clean] = self._file_analysis_count.get(tf_clean, 0) + 1
                             if self._file_analysis_count[tf_clean] >= 3:
-                                repetition_nudge = (
-                                    f"[SYSTEM] You have analyzed '{tf_clean}' {self._file_analysis_count[tf_clean]} times "
-                                    f"with no useful results. This file does NOT contain what you're looking for.\n"
-                                    f"- Check the 'Discovered Web Assets' section — there may be OTHER JS/CSS files to fetch\n"
-                                    f"- Use curl_request to fetch a different resource from the target\n"
-                                    f"- Use ffuf_fuzz to discover new endpoints"
+                                self.memory.record_dead_end(
+                                    f"Repeatedly analyzed {tf_clean} without useful output; deprioritize this artifact."
                                 )
-                                self.messages.append({'role': 'user', 'content': repetition_nudge, '_iteration': self._iteration_counter})
-                                L.log(f"{C_RED}Repetition detector: {tf_clean} analyzed {self._file_analysis_count[tf_clean]}x with empty results{C_RESET}")
+                                self._request_plan_refresh()
+                                L.log(f"{C_RED}Repetition detector: {tf_clean} analyzed {self._file_analysis_count[tf_clean]}x — planner refresh requested{C_RESET}")
                                 break
 
                     # ── Auto-update graph ────────────────────────
