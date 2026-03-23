@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
 from backend.output_processing import OutputProcessor
-from backend.parsers import STATE_EXTRACTORS, TOOL_PARSERS
+from backend.parsers import (
+    STATE_EXTRACTORS,
+    TOOL_PARSERS,
+    _extract_json_payloads,
+    _payload_indicates_success,
+    _payload_messages,
+)
 from backend.planning import Observation
 from backend.state import StateManager
 
@@ -19,6 +26,7 @@ class AnalysisOutcome:
     graph_edges_added: int = 0
     plan_refresh_required: bool = False
     web_assets_added: int = 0
+    state_changed: bool = False
 
 
 class Analyzer:
@@ -34,12 +42,17 @@ class Analyzer:
         graph_nodes_added = 0
         graph_edges_added = 0
         web_assets_added = 0
+        state_changed = False
 
+        before = self.state.to_snapshot() if not result.startswith('[ERROR]') else None
         if name in STATE_EXTRACTORS and not result.startswith('[ERROR]'):
-            before = self.state.to_snapshot()
             STATE_EXTRACTORS[name](result, self.target, self.state)
+        if not result.startswith('[ERROR]'):
+            self._apply_semantic_state_updates(name, args, result)
+        if before is not None:
             after = self.state.to_snapshot()
-            refresh_required = before != after
+            state_changed = before != after
+            refresh_required = refresh_required or state_changed
 
         parsed = None
         if name in TOOL_PARSERS and not result.startswith('[ERROR]') and not result.startswith('[TIMEOUT'):
@@ -90,6 +103,7 @@ class Analyzer:
             graph_edges_added=graph_edges_added,
             plan_refresh_required=refresh_required,
             web_assets_added=web_assets_added,
+            state_changed=state_changed,
         )
 
     def _extract_hostnames(self, output: str) -> list[str]:
@@ -182,6 +196,85 @@ class Analyzer:
             evidence=', '.join(sorted(download_links)[:3]) or f'Observed {url}',
         )
         return True
+
+    def _apply_semantic_state_updates(self, name: str, args: dict, result: str):
+        if name not in {'curl_request', 'web_request'}:
+            return
+
+        url = str(args.get('url', '') or '')
+        if not url:
+            return
+        lower = result.lower()
+        status_code = self._extract_status_code(result)
+        response_body = self._extract_response_body(result)
+        payloads = self._extract_payloads(result)
+        success_payload = any(_payload_indicates_success(payload) for payload in payloads)
+        message_fragments = " ".join(_payload_messages(payloads)).lower()
+        combined = f"{response_body.lower()}\n{message_fragments}\n{lower}"
+
+        if '/api/v1/invite/verify' in url:
+            if (
+                success_payload
+                or '"success":1' in combined
+                or 'invite code is valid' in combined
+                or 'invite is valid' in combined
+                or (status_code in (200, 201) and 'valid' in combined)
+            ):
+                self.state.set_workflow_marker('invite_verified')
+                self.state.add_note('Invite verification succeeded.')
+        elif '/api/v1/user/register' in url:
+            if (
+                success_payload
+                or '"success":1' in combined
+                or 'registration successful' in combined
+                or 'account created' in combined
+                or 'registered' in combined
+            ):
+                self.state.set_workflow_marker('account_registered')
+                self.state.add_note('Account registration succeeded.')
+        elif '/api/v1/user/login' in url:
+            if (
+                success_payload
+                or status_code in (200, 201, 302)
+                and any(token in combined for token in ('login', 'authenticated', 'dashboard', 'phpsessid', 'set-cookie'))
+            ):
+                self.state.set_workflow_marker('authenticated_session')
+                self.state.add_note('Authenticated web session established.')
+
+    @staticmethod
+    def _extract_status_code(result: str) -> int:
+        patterns = (
+            r'(?m)^HTTP Status:\s*(\d+)',
+            r'(?m)^HTTP/\S+\s+(\d+)',
+            r'(?m)^< HTTP/\S+\s+(\d+)',
+            r'(?m)^__LACUNA_HTTP_STATUS__:(\d+)',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, result)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    return 0
+        return 0
+
+    @staticmethod
+    def _extract_response_body(result: str) -> str:
+        body_match = re.search(r'Response Body:\n(.*)', result, re.DOTALL)
+        if body_match:
+            return body_match.group(1).strip()
+        return result.strip()
+
+    @staticmethod
+    def _extract_payloads(result: str) -> list[object]:
+        payloads = _extract_json_payloads(result)
+        if payloads:
+            return payloads
+        body = Analyzer._extract_response_body(result)
+        try:
+            return [json.loads(body)]
+        except Exception:
+            return []
 
 
 def _parse_command_output_for_graph(output: str, target: str) -> dict:

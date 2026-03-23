@@ -359,11 +359,8 @@ def _extract_web_workflow_artifacts(output: str, target: str, state: StateManage
         )
 
     # Scan embedded JSON objects or bare JSON responses.
-    for candidate in re.findall(r'\{.*?\}', output, re.DOTALL):
-        try:
-            payload = json.loads(candidate)
-        except Exception:
-            continue
+    payloads = _extract_json_payloads(output)
+    for payload in payloads:
         _extract_from_json_payload(payload, state)
 
     # Some responses are just quoted/inline encoded values.
@@ -394,21 +391,46 @@ def _extract_web_workflow_artifacts(output: str, target: str, state: StateManage
     current_url = last_url.group(1) if last_url else ''
     status_code = int(status.group(1)) if status else 0
     body_match = re.search(r'Response Body:\n(.*)', output, re.DOTALL)
-    response_body = body_match.group(1).lower() if body_match else lower_output
+    response_body = body_match.group(1) if body_match else output
+    response_body_lower = response_body.lower()
+    success_payload = any(_payload_indicates_success(payload) for payload in payloads)
+    message_fragments = " ".join(_payload_messages(payloads)).lower()
     if current_url.endswith('/api/v1/invite/verify') and status_code in (200, 201):
-        if '"status":"success"' in lower_output or 'invite is valid' in lower_output or '"success":true' in lower_output:
+        if (
+            success_payload
+            or '"success":1' in lower_output
+            or '"success":true' in lower_output
+            or 'invite code is valid' in response_body_lower
+            or 'invite is valid' in response_body_lower
+            or 'valid' in message_fragments
+        ):
             state.set_workflow_marker('invite_verified')
             state.add_note('Invite verification succeeded.')
     if current_url.endswith('/api/v1/user/register') and status_code in (200, 201):
-        if '"status":"success"' in lower_output or 'registration successful' in lower_output or '"success":true' in lower_output:
+        if (
+            success_payload
+            or '"success":1' in lower_output
+            or '"success":true' in lower_output
+            or 'registration successful' in response_body_lower
+            or 'account created' in response_body_lower
+            or 'registered' in message_fragments
+        ):
             state.set_workflow_marker('account_registered')
             state.add_note('Account registration succeeded.')
     if current_url.endswith('/api/v1/user/login') and status_code in (200, 201, 302):
-        if '"status":"success"' in lower_output or 'login successful' in lower_output or redirect or cookie_line:
+        if (
+            success_payload
+            or '"success":1' in lower_output
+            or '"success":true' in lower_output
+            or 'login successful' in response_body_lower
+            or 'welcome' in message_fragments
+            or redirect
+            or cookie_line
+        ):
             state.set_workflow_marker('authenticated_session')
             state.add_note('Authenticated web session established.')
     if current_url.endswith('/home') and status_code == 200:
-        if 'login' not in response_body[:400] and 'forgot password' not in response_body:
+        if 'login' not in response_body_lower[:400] and 'forgot password' not in response_body_lower:
             state.set_workflow_marker('authenticated_session')
             state.add_note('Authenticated dashboard access confirmed.')
 
@@ -455,6 +477,102 @@ def _safe_b64decode(value: str) -> str | None:
 
 def _looks_like_invite_code(value: str) -> bool:
     return bool(re.fullmatch(r'[A-Z0-9]{4,}(?:-[A-Z0-9]{4,}){2,}', value.strip()))
+
+
+def _extract_json_payloads(output: str) -> list[object]:
+    payloads: list[object] = []
+    body_match = re.search(r'Response Body:\n(.*)', output, re.DOTALL)
+    candidates = []
+    if body_match:
+        candidates.append(body_match.group(1).strip())
+    candidates.append(output.strip())
+    candidates.extend(re.findall(r'\{.*?\}', output, re.DOTALL))
+
+    seen = set()
+    for candidate in candidates:
+        cleaned = (candidate or '').strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        try:
+            payloads.append(json.loads(cleaned))
+            continue
+        except Exception:
+            pass
+        for match in re.finditer(r'\{.*?\}', cleaned, re.DOTALL):
+            blob = match.group(0).strip()
+            if not blob or blob in seen:
+                continue
+            seen.add(blob)
+            try:
+                payloads.append(json.loads(blob))
+            except Exception:
+                continue
+    return payloads
+
+
+def _payload_indicates_success(payload: object) -> bool:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            key_lower = str(key).lower()
+            if key_lower in {'success', 'valid', 'verified', 'authenticated'}:
+                if _truthy_response_value(value):
+                    return True
+            if key_lower in {'status', 'code', 'http_status'}:
+                if _success_status_value(value):
+                    return True
+            if key_lower in {'message', 'detail', 'result'} and isinstance(value, str):
+                lower = value.lower()
+                if any(token in lower for token in ('valid', 'success', 'registered', 'authenticated', 'logged in')):
+                    return True
+            if _payload_indicates_success(value):
+                return True
+    elif isinstance(payload, list):
+        return any(_payload_indicates_success(item) for item in payload)
+    return False
+
+
+def _payload_messages(payloads: list[object]) -> list[str]:
+    messages: list[str] = []
+    for payload in payloads:
+        _collect_payload_messages(payload, messages)
+    return messages
+
+
+def _collect_payload_messages(payload: object, messages: list[str]):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            key_lower = str(key).lower()
+            if key_lower in {'message', 'detail', 'result', 'error'} and isinstance(value, str):
+                messages.append(value)
+            else:
+                _collect_payload_messages(value, messages)
+    elif isinstance(payload, list):
+        for item in payload:
+            _collect_payload_messages(item, messages)
+
+
+def _truthy_response_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return normalized in {'1', 'true', 'yes', 'ok', 'valid', 'success'}
+    return False
+
+
+def _success_status_value(value: object) -> bool:
+    if isinstance(value, int):
+        return 200 <= value < 300
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized.isdigit():
+            code = int(normalized)
+            return 200 <= code < 300
+        return normalized in {'success', 'ok', 'valid'}
+    return False
 
 
 def extract_state_from_pcap(output: str, target: str, state: StateManager):

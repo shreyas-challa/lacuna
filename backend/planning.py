@@ -302,7 +302,8 @@ class Planner:
             return PlanBuildResult(plan=seed, source=seed.source, error=str(exc))
 
         content = response.choices[0].message.content or ""
-        plan = _parse_json_plan(content, seed)
+        proposed = _parse_json_plan(content, seed)
+        plan = _merge_seed_plan(seed, proposed)
         usage = extract_usage(response, model=plan.source == "llm" and self.model_override or get_active_model())
         if not plan.tasks:
             plan = seed
@@ -310,12 +311,14 @@ class Planner:
 
     async def _refine_with_llm(self, seed: AttackPlan, phase: str, state_snapshot: dict, memory_snapshot: dict):
         system = (
-            "You are Lacuna's strategic planner. Build a concise attack task tree. "
+            "You are Lacuna's strategic planner. Refine the provided seed attack task tree. "
             "Respond with JSON only: "
             '{"objective":"...","source":"llm","rationale":"...","tasks":[{"id":"...","title":"...",'
             '"description":"...","status":"active|pending|blocked|done","priority":10,'
             '"parent_id":null,"tool_hints":["..."],"success_criteria":"...","evidence":["..."]}]}. '
-            "Prefer one active task, several pending tasks, and statuses grounded in the provided state."
+            "Rules: reuse only task ids that already exist in seed_plan; do not invent or rename milestones; "
+            "use the state as the authority for what is already complete; refine descriptions, evidence, "
+            "tool_hints, and ordering so the next active step is strategically correct."
         )
         user = {
             "phase": phase,
@@ -571,6 +574,61 @@ def _parse_json_plan(content: str, seed: AttackPlan) -> AttackPlan:
     return plan
 
 
+def _merge_seed_plan(seed: AttackPlan, proposed: AttackPlan) -> AttackPlan:
+    merged = AttackPlan.from_dict(seed.to_dict(), fallback_objective=seed.objective)
+    merged.objective = proposed.objective or seed.objective
+    merged.source = proposed.source or seed.source
+    merged.rationale = proposed.rationale or seed.rationale
+    merged.updated_at = time.time()
+
+    proposed_by_id = {task.id: task for task in proposed.tasks}
+    for task in merged.tasks:
+        update = proposed_by_id.get(task.id)
+        if not update:
+            continue
+        if update.title:
+            task.title = update.title
+        if update.description:
+            task.description = update.description
+        if update.parent_id in {item.id for item in merged.tasks} or update.parent_id is None:
+            task.parent_id = update.parent_id
+        if update.tool_hints:
+            task.tool_hints = update.tool_hints[:6]
+        if update.success_criteria:
+            task.success_criteria = update.success_criteria
+        if update.priority:
+            task.priority = max(1, min(99, int(update.priority)))
+        for item in update.evidence:
+            if item and item not in task.evidence:
+                task.evidence.append(item)
+        task.status = _merge_status(task.status, update.status)
+
+    merged.ensure_single_active()
+    return merged
+
+
+def _merge_status(seed_status: str, proposed_status: str) -> str:
+    normalized_seed = (seed_status or "pending").strip().lower()
+    normalized_proposed = (proposed_status or "").strip().lower()
+    if not normalized_proposed:
+        return normalized_seed
+    if normalized_seed == "done":
+        return "done"
+    if normalized_proposed == "done":
+        return "done"
+    if normalized_seed == "active" and normalized_proposed == "pending":
+        return "active"
+    if normalized_seed == "blocked" and normalized_proposed == "pending":
+        return "blocked"
+    if normalized_seed == "pending" and normalized_proposed == "blocked":
+        return "blocked"
+    if normalized_seed == "pending" and normalized_proposed == "active":
+        return "active"
+    if normalized_seed == "active" and normalized_proposed == "blocked":
+        return "blocked"
+    return normalized_seed
+
+
 def _clean_list(value) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -585,4 +643,3 @@ def _clean_list(value) -> list[str]:
 def _slugify(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return cleaned[:48]
-

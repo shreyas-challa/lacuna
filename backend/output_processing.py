@@ -81,6 +81,24 @@ class OutputProcessor:
         if "set-cookie" in result.lower() or re.search(r"(?m)^Cookies:\s+\S", result):
             notable.append("Session cookies were observed.")
 
+        lower = result.lower()
+        milestone_follow_up = ""
+        if "/api/v1/invite/verify" in url and (
+            '"success":1' in lower or '"success":true' in lower or 'invite code is valid' in lower
+        ):
+            notable.append("Invite verification succeeded.")
+            milestone_follow_up = "Proceed to registration using the verified invite and the same web session."
+        elif "/api/v1/user/register" in url and (
+            '"success":1' in lower or '"success":true' in lower or 'registration successful' in lower
+        ):
+            notable.append("Account registration succeeded.")
+            milestone_follow_up = "Log in immediately and preserve the authenticated session."
+        elif "/api/v1/user/login" in url and (
+            '"success":1' in lower or '"success":true' in lower or 'login successful' in lower or 'set-cookie' in lower
+        ):
+            notable.append("Authenticated session established.")
+            milestone_follow_up = "Enumerate authenticated application features and privileged endpoints next."
+
         status_text = status.group(1) if status else "unknown"
         summary = f"{tool_name} fetched {url or 'web content'} with status {status_text}."
         if api_paths:
@@ -96,6 +114,7 @@ class OutputProcessor:
                 "Test adjacent numeric IDs and sibling download endpoints." if numeric_paths else "",
                 "Use the same web session for the next workflow step." if "set-cookie" in result.lower() else "",
                 "Fetch and analyze any unfamiliar JS or download path." if api_paths or downloads else "",
+                milestone_follow_up,
             ] if item],
         )
 
