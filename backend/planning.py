@@ -291,9 +291,10 @@ class Planner:
         self.model_override = configured or self._default_planner_model()
         self.backend_override = self._choose_backend(configured)
 
-    async def build_plan(self, phase: str, state_snapshot: dict, memory_snapshot: dict) -> PlanBuildResult:
+    async def build_plan(self, phase: str, state_snapshot: dict, memory_snapshot: dict,
+                         force_template: bool = False) -> PlanBuildResult:
         seed = self._build_template_plan(phase, state_snapshot, memory_snapshot)
-        if not self.model_override:
+        if force_template or not self.model_override:
             return PlanBuildResult(plan=seed, source=seed.source)
 
         try:
@@ -460,15 +461,19 @@ class Planner:
                 success="Read /root/root.txt and complete the run.",
             )
 
-        if not tasks:
+        # Guarantee there is always something actionable. Without this, a box
+        # whose only task (enum-services) is marked done — but with no web app or
+        # creds yet — leaves zero active/pending tasks and the loop spins doing
+        # planner refreshes with no operator action.
+        if not any(task.status in ("active", "pending") for task in tasks):
             self._add_task(
                 tasks,
                 "fallback-enum",
-                "Run focused enumeration for one high-signal surface",
+                "Enumerate one high-signal surface in depth",
                 status="active",
                 priority=10,
-                tool_hints=["nmap_scan", "curl_request"],
-                success="Identify at least one actionable service or application workflow.",
+                tool_hints=["nmap_scan", "curl_request", "gobuster_dir", "query_kb"],
+                success="Identify at least one actionable service, credential, or workflow.",
             )
 
         rationale = "Task tree derived from structured state, workflow markers, and common HTB attack templates."

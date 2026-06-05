@@ -378,6 +378,8 @@ class Agent:
         self._planner_calls: int = 0
         # Bounded stall-recovery: broaden surface instead of abandoning the target
         self._stall_recoveries: int = 0
+        # Guard against the planner producing no actionable task (no-op spin)
+        self._no_task_iterations: int = 0
 
     def _get_knowledge_hints(self) -> str:
         """Match discovered services against exploit knowledge base."""
@@ -531,7 +533,7 @@ class Agent:
 
         plan.ensure_single_active()
 
-    async def _refresh_plan(self, reason: str = "", force: bool = False):
+    async def _refresh_plan(self, reason: str = "", force: bool = False, template_only: bool = False):
         if not force and not self._plan_refresh_required:
             return
 
@@ -540,6 +542,7 @@ class Agent:
             self.phase,
             self.state.to_snapshot(),
             self.memory.to_snapshot(),
+            force_template=template_only,
         )
         self.memory.set_plan(result.plan, reason or result.source)
         self._sync_plan_progress()
@@ -972,9 +975,26 @@ class Agent:
                 await self._refresh_plan(reason='iteration start')
                 operator_context = self._build_operator_context()
                 if not operator_context:
-                    self._request_plan_refresh()
+                    self._no_task_iterations += 1
                     self.memory.record_dead_end("Planner returned no active task; requesting replanning.")
-                    continue
+                    # The LLM planner can keep marking every task done/blocked,
+                    # leaving nothing actionable — that produced a 12-iteration
+                    # no-op spin. Fall back to a deterministic template plan
+                    # (always has an active task), then give up only if even that
+                    # yields nothing.
+                    if self._no_task_iterations >= 2:
+                        await self._refresh_plan(reason='no active task — template fallback',
+                                                 force=True, template_only=True)
+                        operator_context = self._build_operator_context()
+                    if not operator_context:
+                        if self._no_task_iterations >= 4:
+                            L.log(f"{C_RED}No actionable task after {self._no_task_iterations} attempts — completing{C_RESET}")
+                            self.phase = 'complete'
+                            self._done = True
+                            break
+                        self._request_plan_refresh()
+                        continue
+                self._no_task_iterations = 0
 
                 tools = self._get_tools()
                 if operator_context.task_id != self.operator.current_task_id:
