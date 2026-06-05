@@ -81,6 +81,23 @@ _NO_CACHE = frozenset({
     'web_request',
 })
 
+# ── External binary each tool needs (only tools needing a CLI binary) ───
+# Tools not listed here are pure-Python or use always-present basics (curl/ssh/sh).
+TOOL_REQUIRED_BINARY = {
+    'nmap_scan': 'nmap',
+    'gobuster_dir': 'gobuster',
+    'ffuf_fuzz': 'ffuf',
+    'whatweb_scan': 'whatweb',
+    'nuclei_scan': 'nuclei',
+    'nikto_scan': 'nikto',
+    'searchsploit': 'searchsploit',
+    'sqlmap_scan': 'sqlmap',
+    'hydra_brute': 'hydra',
+    'wpscan': 'wpscan',
+    'msfconsole_run': 'msfconsole',
+    'setup_listener': 'nc',
+}
+
 # ── Meta tools (always available) ───────────────────────────────
 META_TOOLS = [
     {
@@ -331,6 +348,12 @@ class Agent:
         self.total_cached_tokens = 0
         self._tool_failures: dict[str, int] = {}
         self._tool_failure_iter: dict[str, int] = {}  # last-failure iteration, for cooldown decay
+        # Hide tools whose CLI binary isn't installed — avoids wasted calls and
+        # phantom failures on tools that can never succeed in this environment.
+        self._unavailable_tools = {
+            name for name, binary in TOOL_REQUIRED_BINARY.items()
+            if shutil.which(binary) is None
+        }
         # Reasoning layer tracking
         self._plan_injected_for_phase: set[str] = set()
         self._current_strategy: str = ''
@@ -388,6 +411,7 @@ class Agent:
             name for name, count in self._tool_failures.items()
             if count >= 3 and (self.total_iterations - self._tool_failure_iter.get(name, 0)) < 6
         }
+        blocked |= self._unavailable_tools
         if blocked:
             phase_tools = [t for t in phase_tools if t['function']['name'] not in blocked]
         return META_TOOLS + phase_tools
@@ -849,6 +873,9 @@ class Agent:
         if self.lhost:
             L.header(f"{C_BOLD}{C_BLUE}  LHOST: {self.lhost}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}  Log: {L.log_path}{C_RESET}")
+        if self._unavailable_tools:
+            missing = ', '.join(sorted(self._unavailable_tools))
+            L.header(f"{C_BOLD}{C_YELLOW}  Disabled (binary not installed): {missing}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}{'='*60}{C_RESET}\n")
 
         self.graph.add_node(self.target, self.target, 'machine')
