@@ -339,6 +339,7 @@ class Agent:
         self.journal = RunJournal(target, LOGS_DIR)
         self._done = False
         self._tool_cache: dict[str, str] = {}
+        self._stateful_call_counts: dict[str, int] = {}  # repeat-detection for uncached stateful calls
         self._tool_call_count = 0
         self._nmap_call_count: int = 0
         self._phase_entry_iteration = 0
@@ -1120,11 +1121,28 @@ class Agent:
 
                     # ── Cache check ──────────────────────────────
                     cache_key = f"{name}|{json.dumps(args, sort_keys=True)}"
-                    if _should_cache_tool(name, args) and cache_key in self._tool_cache:
+                    cacheable = _should_cache_tool(name, args)
+                    repeat_count = self._stateful_call_counts.get(cache_key, 0)
+                    if cacheable and cache_key in self._tool_cache:
                         result = f"[CACHED - identical call already executed] {self._tool_cache[cache_key][:3000]}"
                         tool_time = 0.0
                         L.log(f"{C_YELLOW}Cache hit: {name}{C_RESET}")
+                    elif (not cacheable and repeat_count >= 2
+                          and name not in ('transition_phase', 'append_report')):
+                        # Stateful calls aren't cached, so identical repeats (the 6x-POST
+                        # pathology) otherwise run free. Allow one retry, then short-circuit.
+                        self._stateful_call_counts[cache_key] = repeat_count + 1
+                        result = (
+                            f"[REPEAT BLOCKED] You already issued this exact {name} call "
+                            f"{repeat_count} times and the target state did not change. Repeating it "
+                            "will not help — change the endpoint, parameters, payload, or session, or "
+                            "pursue a different lead."
+                        )
+                        tool_time = 0.0
+                        L.log(f"{C_YELLOW}Repeat blocked: {name} (x{repeat_count}, no progress){C_RESET}")
                     else:
+                        if not cacheable:
+                            self._stateful_call_counts[cache_key] = repeat_count + 1
                         self._tool_call_count += 1
                         if name == 'nmap_scan':
                             self._nmap_call_count += 1
@@ -1209,6 +1227,8 @@ class Agent:
                         self._last_progress_iteration = self.total_iterations
                         self._active_task_stall_count = 0
                         iteration_progress = True
+                        # Real progress → forgive prior repeats so valid re-tries aren't blocked.
+                        self._stateful_call_counts.clear()
                     if new_fingerprint != self._last_state_fingerprint or analysis.plan_refresh_required:
                         self._request_plan_refresh()
                         self._last_state_fingerprint = new_fingerprint
