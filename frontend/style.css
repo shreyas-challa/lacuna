@@ -127,10 +127,6 @@
     0 2px 4px 0 rgba(0,0,0,0.30);
 }
 
-/* ─── View Transition (theme toggle) reset ─── */
-::view-transition-old(root),
-::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
-
 html { background: var(--background); }
 
 body {
@@ -266,26 +262,6 @@ body {
   min-width: 92px;
   text-align: right;
 }
-
-/* ─── Icon button ─── */
-.icon-button {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
-  border: 1px solid var(--border);
-  background: var(--card);
-  color: var(--muted-foreground);
-  cursor: pointer;
-  transition: background .18s, color .18s, border-color .18s;
-}
-.icon-button:hover { background: var(--card-hover); color: var(--foreground); }
-.icon-button svg { width: 17px; height: 17px; }
-#theme-toggle .icon-moon { display: none; }
-#theme-toggle .icon-sun { display: block; }
-.dark #theme-toggle .icon-moon { display: block; }
-.dark #theme-toggle .icon-sun { display: none; }
 
 /* ─── Main layout ─── */
 main {

@@ -4,16 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Lacuna — Security Research Agent</title>
-  <!-- Set theme before paint to avoid flash -->
-  <script>
-    (function () {
-      try {
-        var t = localStorage.getItem('lacuna-theme');
-        if (t === 'light') document.documentElement.classList.remove('dark');
-        else document.documentElement.classList.add('dark');
-      } catch (e) { document.documentElement.classList.add('dark'); }
-    })();
-  </script>
   <link rel="stylesheet" href="/static/style.css">
   <script src="https://d3js.org/d3.v7.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -42,15 +32,6 @@
       <span id="status-dot" class="status-dot"></span>
       <span id="status-text">IDLE</span>
     </div>
-
-    <button id="theme-toggle" class="icon-button" title="Toggle theme" aria-label="Toggle theme">
-      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
-      </svg>
-      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-      </svg>
-    </button>
   </header>
 
   <!-- Main content -->
@@ -133,7 +114,6 @@
     </div>
   </footer>
 
-  <script src="/static/theme.js"></script>
   <script src="/static/graph.js"></script>
   <script src="/static/toolpanel.js"></script>
   <script src="/static/report.js"></script>
