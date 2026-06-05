@@ -5,14 +5,16 @@ Escalate to root. ALL commands must be run on the TARGET via sshpass — check t
 ### Command Template
 Every command: `sshpass -p 'PASSWORD' ssh -o StrictHostKeyChecking=no USER@TARGET 'COMMAND'`
 
-### Priority Order (MANDATORY — execute in this exact order)
-1. `check_sudo` — check sudo permissions
-2. `check_capabilities` — check Linux capabilities (cap_setuid = instant root)
-3. `check_suid` — find SUID binaries
-4. `check_cron` — check cron jobs
-5. `run_linpeas` — only if above checks find nothing
-6. Do NOT attempt exploitation (compiling exploits, PwnKit, Metasploit) until ALL 4 checks above are complete
-7. Use dedicated tools — never use `execute_command` for these checks
+### Enumerate before you exploit
+Run these high-value checks early — they find most privesc paths. Order is a
+guideline, not a ritual; follow the strongest lead as soon as you see it.
+1. `check_sudo` — sudo permissions (a `sudo -l` GTFOBin is often instant root)
+2. `check_capabilities` — Linux capabilities (cap_setuid = instant root)
+3. `check_suid` — SUID binaries
+4. `check_cron` — cron jobs and writable scheduled scripts
+5. `run_linpeas` — broader sweep if the targeted checks come up empty
+6. Do at least one of the checks above before launching a kernel/PwnKit/Metasploit exploit — don't blind-fire exploits
+7. Use the dedicated check tools (they parse results into state) — not `execute_command`
 
 ### PwnKit / pkexec Safety Gate
 - Seeing `/usr/bin/pkexec` alone is NOT evidence of vulnerability.

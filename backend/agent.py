@@ -330,6 +330,7 @@ class Agent:
         self.total_cost = 0.0
         self.total_cached_tokens = 0
         self._tool_failures: dict[str, int] = {}
+        self._tool_failure_iter: dict[str, int] = {}  # last-failure iteration, for cooldown decay
         # Reasoning layer tracking
         self._plan_injected_for_phase: set[str] = set()
         self._current_strategy: str = ''
@@ -380,8 +381,13 @@ class Agent:
 
     def _get_tools(self) -> list[dict]:
         phase_tools = get_tools_for_phase(self.phase)
-        # Circuit breaker: exclude tools that have failed 2+ times consecutively
-        blocked = {name for name, count in self._tool_failures.items() if count >= 2}
+        # Circuit breaker as a COOLDOWN, not a permanent ban: a tool that failed
+        # 3+ times is hidden for a few iterations, then offered again (e.g. nmap
+        # that needs -Pn shouldn't be disabled for the whole run).
+        blocked = {
+            name for name, count in self._tool_failures.items()
+            if count >= 3 and (self.total_iterations - self._tool_failure_iter.get(name, 0)) < 6
+        }
         if blocked:
             phase_tools = [t for t in phase_tools if t['function']['name'] not in blocked]
         return META_TOOLS + phase_tools
@@ -558,10 +564,11 @@ class Agent:
             'privesc-sudo', 'privesc-caps', 'privesc-suid', 'privesc-cron',
         }
         if task.id in strict_tasks and name in noisy_tools:
+            # Advisory only — the tool still runs, but the model is reminded of the
+            # cheaper preferred path. (Previously this hard-blocked the call.)
             return (
-                f"[ERROR] Active plan task: {task.title}. "
-                f"Preferred tools: {', '.join(task.tool_hints)}. "
-                f"Success condition: {task.success_criteria}"
+                f"[GUIDANCE] Active task '{task.title}' is usually advanced faster with: "
+                f"{', '.join(task.tool_hints)}. Success condition: {task.success_criteria}"
             )
         return None
 
@@ -596,16 +603,19 @@ class Agent:
             )
 
         required = {'check_sudo', 'check_capabilities', 'check_suid', 'check_cron'}
-        if not required.issubset(self._privesc_checks_done):
+        # Only require that SOME enumeration has happened — not the full checklist
+        # in a fixed order. "Look before you leap", without the rigid gating that
+        # permanently stalled privesc when a check command failed to format.
+        if not (self._privesc_checks_done & required):
             exploit_markers = (
                 'pkexec', 'pwnkit', 'cve-2021-4034', '/tmp/exploit',
                 'msfconsole', 'os.setuid(0)', 'chmod u+s',
             )
             if any(marker in command for marker in exploit_markers):
-                missing = sorted(required - self._privesc_checks_done)
                 return (
-                    "[ERROR] Exploit attempt blocked: complete privesc checklist first. "
-                    f"Missing: {', '.join(missing)}."
+                    "[ERROR] Run at least one privesc enumeration check first "
+                    "(check_sudo / check_capabilities / check_suid / check_cron), "
+                    "then attempt the exploit."
                 )
         return None
 
@@ -1065,7 +1075,7 @@ class Agent:
                     args, sanitize_note = sanitize_tool_args(name, args, context=_sanitize_ctx)
                     if sanitize_note:
                         L.log(f"{C_YELLOW}Args sanitized for {name}: {sanitize_note}{C_RESET}")
-                    plan_drift_error = self._guard_plan_drift(name, args)
+                    plan_drift_note = self._guard_plan_drift(name, args)
                     transition_error = self._guard_phase_transition(name, args)
 
                     call_id = tc.id
@@ -1094,9 +1104,7 @@ class Agent:
                         await self._broadcast_budget()
                         tool_start = time.time()
                         # ── curl redirect check ──────────────
-                        if plan_drift_error:
-                            result = plan_drift_error
-                        elif transition_error:
+                        if transition_error:
                             result = transition_error
                         elif name == 'execute_command':
                             guard_error = self._guard_execute_command(args)
@@ -1127,7 +1135,10 @@ class Agent:
                         if _should_cache_tool(name, args):
                             self._tool_cache[cache_key] = result
 
-                    # Prepend sanitization note so the model sees it
+                    # Prepend advisory notes so the model sees them (without
+                    # blocking the call or tripping the failure tracker).
+                    if plan_drift_note and not result.startswith('[ERROR]'):
+                        result = f"{plan_drift_note}\n\n{result}"
                     if sanitize_note:
                         result = f"[NOTE: {sanitize_note}]\n\n{result}"
 
@@ -1144,11 +1155,13 @@ class Agent:
                     # Circuit breaker: track consecutive failures per tool
                     if result.startswith('[ERROR]') or result.startswith('[TIMEOUT'):
                         self._tool_failures[name] = self._tool_failures.get(name, 0) + 1
+                        self._tool_failure_iter[name] = self.total_iterations
                         self.memory.record_dead_end(f"{name}: {result.splitlines()[0][:180]}")
-                        if self._tool_failures[name] >= 2:
-                            L.log(f"{C_RED}Circuit breaker: {name} failed {self._tool_failures[name]}x — temporarily disabled{C_RESET}")
+                        if self._tool_failures[name] >= 3:
+                            L.log(f"{C_RED}Circuit breaker: {name} failed {self._tool_failures[name]}x — cooling down{C_RESET}")
                     else:
                         self._tool_failures.pop(name, None)
+                        self._tool_failure_iter.pop(name, None)
                         if name in {'check_sudo', 'check_capabilities', 'check_suid', 'check_cron'}:
                             self._privesc_checks_done.add(name)
 
