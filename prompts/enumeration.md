@@ -26,10 +26,9 @@ Use `query_kb` to instantly look up:
 
 ### Key Tips
 - If the Discovered Credentials section shows credentials, STOP enumerating and transition to exploitation immediately
-- PCAP files are goldmines — always analyze them with `download_and_analyze`
-- **Invite-based apps**: If JS or `/invite` reveals `/api/v1/invite/how/to/generate` and `/api/v1/invite/generate`, use `web_request` with one stable `session_name`, fetch the generated value, decode it with `decode_text`, verify it, then register and log in. Do not brute-force form fields before following this flow.
-- **IDOR check**: If you find URLs with numeric IDs (e.g. `/data/1`, `/download/3`, `/user/5`), ALWAYS try `/data/0` — ID 0 often contains pre-existing data from other users (captures, configs, credentials). This is a critical attack pattern.
-- **Empty pcap?** If a downloaded pcap is empty, it's likely YOUR session's capture. Try downloading ID 0 instead — that's usually the admin's or another user's capture with credentials.
+- **Downloadable artifacts** (pcaps, configs, backups, DB dumps, exports) frequently contain credentials — analyze them with `download_and_analyze` before brute-forcing
+- **Multi-step web workflows**: follow the application's own flow — read its custom JS and API endpoints, decode any tokens with `decode_text`, and reuse one stable `session_name` so cookies persist — before brute-forcing form fields
+- **IDOR check**: if you find URLs with numeric object IDs (e.g. `/data/1`, `/download/3`, `/user/5`), test adjacent IDs — including `0` and `1` — since other users' objects are a common IDOR win. If a returned object looks empty or session-specific, a different ID may belong to another user
 - Don't waste calls on directory brute-forcing unless the web app structure is unclear
 - Avoid long extension brute-force runs early. Learn the app before fuzzing it.
 - If nmap shows a service version that matches a known exploit (shown in the prompt), go directly to exploitation

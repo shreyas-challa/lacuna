@@ -15,7 +15,7 @@ Before every action, ask: "What is the fastest path to root?" Choose accordingly
 
 ## HOSTNAME / VHOST HANDLING
 - Hostnames are auto-added to /etc/hosts when detected. You can use hostnames directly in URLs.
-- If nmap shows a redirect to a hostname (e.g. `2million.htb`), use that hostname in your URLs: `http://2million.htb/`
+- If nmap or an HTTP response redirects to a hostname (e.g. `target.htb`), use that hostname in your URLs: `http://target.htb/`
 - Do NOT manually add `-H 'Host: ...'` headers — just use the hostname in the URL directly.
 
 ## CREDENTIAL MANAGEMENT
