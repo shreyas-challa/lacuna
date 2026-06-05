@@ -75,7 +75,7 @@ ARG_ALIASES = {
 
 # ── Tools that must never be cached (stateful / side-effects) ───
 _NO_CACHE = frozenset({
-    'transition_phase', 'append_report', 'update_graph',
+    'transition_phase', 'append_report',
     'msfconsole_run', 'send_payload', 'setup_listener',
     'run_linpeas', 'check_sudo', 'check_suid', 'check_cron', 'check_capabilities',
     'web_request',
@@ -1403,11 +1403,6 @@ class Agent:
     async def _execute_tool(self, name: str, args: dict) -> str:
         L = self.logger
 
-        if name == 'update_graph':
-            self.graph.update_from_args(args)
-            await self._broadcast_graph()
-            return "Graph updated."
-
         if name == 'transition_phase':
             return f"Transitioning to {args.get('next_phase', 'next')}. Reason: {args.get('reason', '')}"
 
@@ -1460,51 +1455,3 @@ class Agent:
 
     async def _broadcast_graph(self):
         await self.manager.broadcast('graph_update', self.graph.get_state())
-
-
-# ── Graph extraction from command output ─────────────────────────
-
-def _parse_command_output_for_graph(output: str, target: str) -> dict:
-    try:
-        nodes, edges = [], []
-
-        for m in re.finditer(r'uid=\d+\((\w+)\)', output):
-            user = m.group(1)
-            if user == 'root':
-                nodes.append({'id': 'root-access', 'label': 'ROOT ACCESS', 'type': 'root'})
-                edges.append({'source': target, 'target': 'root-access', 'label': 'privesc'})
-            elif user != 'nobody':
-                node_id = f'user-{user}'
-                nodes.append({'id': node_id, 'label': f'User: {user}', 'type': 'user'})
-                edges.append({'source': target, 'target': node_id, 'label': 'ssh'})
-
-        if re.search(r'user\.txt', output) and re.search(r'[0-9a-f]{32}', output):
-            nodes.append({'id': 'user-flag', 'label': 'user.txt', 'type': 'vulnerability'})
-
-        if re.search(r'root\.txt', output) and re.search(r'[0-9a-f]{32}', output):
-            nodes.append({'id': 'root-flag', 'label': 'root.txt', 'type': 'root'})
-            edges.append({'source': 'root-access', 'target': 'root-flag', 'label': 'flag'})
-
-        ftp_users = []
-        for m in re.finditer(r'USER\s+(\S+)', output):
-            user = m.group(1)
-            if user and user not in ('anonymous', 'ftp'):
-                ftp_users.append(user)
-                nodes.append({'id': f'user-{user}', 'label': f'User: {user}', 'type': 'user'})
-                edges.append({'source': target, 'target': f'user-{user}', 'label': 'cred found'})
-        for i, m in enumerate(re.finditer(r'PASS\s+(\S+)', output)):
-            passwd = m.group(1)
-            node_id = f'cred-{passwd[:30]}'
-            nodes.append({'id': node_id, 'label': f'Password: {passwd}', 'type': 'vulnerability'})
-            if i < len(ftp_users):
-                edges.append({'source': f'user-{ftp_users[i]}', 'target': node_id, 'label': 'password'})
-            else:
-                edges.append({'source': target, 'target': node_id, 'label': 'credential'})
-
-        if 'cap_setuid' in output:
-            nodes.append({'id': 'vuln-cap-setuid', 'label': 'cap_setuid', 'type': 'vulnerability'})
-            edges.append({'source': target, 'target': 'vuln-cap-setuid', 'label': 'capability'})
-
-        return {'nodes': nodes, 'edges': edges}
-    except Exception:
-        return {'nodes': [], 'edges': []}
