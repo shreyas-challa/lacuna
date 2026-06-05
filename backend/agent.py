@@ -353,6 +353,8 @@ class Agent:
         self._tracked_task_id: str = ''
         self._active_task_stall_count: int = 0
         self._planner_calls: int = 0
+        # Bounded stall-recovery: broaden surface instead of abandoning the target
+        self._stall_recoveries: int = 0
 
     def _get_knowledge_hints(self) -> str:
         """Match discovered services against exploit knowledge base."""
@@ -620,6 +622,46 @@ class Agent:
                 )
         return None
 
+    def _recover_from_stagnation(self, iters_since_progress: int):
+        """On a stall, switch attack surface and replan instead of giving up.
+
+        Returns:
+          None  → recovery attempts exhausted; caller may complete.
+          True  → phase changed (dropped back to enumeration); caller re-enters loop.
+          False → same phase, broadened in place; caller continues.
+
+        Bounded by MAX_RECOVERIES so a truly stuck run can't burn the whole budget,
+        but we no longer abandon a box the instant it stalls.
+        """
+        MAX_RECOVERIES = 3
+        if self._stall_recoveries >= MAX_RECOVERIES:
+            return None
+        self._stall_recoveries += 1
+        L = self.logger
+        # Earlier transient failures shouldn't keep tools disabled while we re-broaden.
+        self._tool_failures.clear()
+        self._request_plan_refresh()
+
+        if self.phase in ('exploitation', 'privesc'):
+            # No foothold here means the lead was wrong — go find another way in.
+            self.memory.record_dead_end(
+                f"No foothold after {iters_since_progress} iterations in {self.phase}; the current "
+                "lead is a dead end. Return to enumeration and pursue a DIFFERENT service or surface."
+            )
+            self.phase = 'enumeration'
+            self._phase_entry_iteration = self.total_iterations
+            self._phase_entry_node_count = len(self.graph.nodes)
+            L.log(f"{C_YELLOW}Stagnation recovery #{self._stall_recoveries}: dropping back to ENUMERATION for a new surface{C_RESET}")
+            return True
+
+        self.memory.record_dead_end(
+            f"Enumeration stalled for {iters_since_progress} iterations with no actionable findings. "
+            "Switch surface: a different port/service, a new wordlist, untried web paths, FTP/SMB/SNMP, "
+            "or service-specific tooling — do not repeat prior calls."
+        )
+        L.log(f"{C_YELLOW}Stagnation recovery #{self._stall_recoveries}: broadening enumeration + replanning{C_RESET}")
+        return False
+
     # ── Adaptive Strategy Engine ─────────────────────────────────
 
     async def _evaluate_strategy(self):
@@ -878,29 +920,22 @@ class Agent:
                     self._tracked_task_id = active_task_id
                     self._active_task_stall_count = 0
 
-                # ── Stagnation detection ─────────────────────────
-                iters_in_phase = self.total_iterations - self._phase_entry_iteration
+                # ── Stagnation → broaden surface, don't abandon the box ──
                 iters_since_progress = self.total_iterations - self._last_progress_iteration
-
-                # Hard stagnation: in exploitation/privesc without access for too long → complete
-                if iters_since_progress > 15 and self.phase in ('exploitation', 'privesc'):
-                    has_access = bool(self.state.accesses)
-                    has_creds = bool(self.state.credentials)
-                    if not has_access and not has_creds:
-                        L.log(f"{C_RED}Hard stagnation: {self.phase} for {iters_since_progress} iterations without state progress — completing{C_RESET}")
+                stall_limit = 25 if self.phase == 'enumeration' else 15
+                if iters_since_progress > stall_limit and not self.state.accesses:
+                    recovery = self._recover_from_stagnation(iters_since_progress)
+                    if recovery is None:
+                        L.log(f"{C_RED}Stagnation unrecoverable after {self._stall_recoveries} recovery attempts — completing{C_RESET}")
                         self.phase = 'complete'
                         self._done = True
                         break
-
-                # Hard stagnation: enumeration spinning without progress → force transition
-                if iters_since_progress > 25 and self.phase == 'enumeration':
-                    has_creds = bool(self.state.credentials)
-                    has_access = bool(self.state.accesses)
-                    if not has_creds and not has_access:
-                        L.log(f"{C_RED}Hard stagnation: enumeration for {iters_since_progress} iterations without state progress — completing{C_RESET}")
-                        self.phase = 'complete'
-                        self._done = True
+                    self._last_progress_iteration = self.total_iterations
+                    if recovery:  # phase changed → re-enter outer loop with new budget
+                        await self.manager.broadcast('phase_change', {'phase': self.phase})
+                        await self._broadcast_budget()
                         break
+                    continue  # same phase, just broaden + replan
 
                 # ── Auto-complete if root flag found ─────────────
                 if self.state.has_root(self.target) and 'root_flag' in self.state.loot:
