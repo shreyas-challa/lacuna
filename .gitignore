@@ -10,3 +10,6 @@ build/
 wordlists/
 logs/
 output/
+DESIGN_SYSTEM.md
+cookies.txt
+hydra.restore
