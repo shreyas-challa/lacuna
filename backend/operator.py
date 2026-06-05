@@ -63,14 +63,27 @@ class Operator:
     async def next_turn(self, context: OperatorTaskContext, tools: list[dict]) -> OperatorTurn:
         if context.task_id != self.current_task_id:
             self.current_task_id = context.task_id
-            self.history = [{
-                'role': 'user',
-                'content': (
-                    f"Start task {context.task_id}: {context.task_title}. "
-                    f"Success condition: {context.success_criteria or 'Advance this task concretely.'}"
-                ),
-            }]
-            self._iteration = 0
+            success = context.success_criteria or 'Advance this task concretely.'
+            if not self.history:
+                # First task — seed the conversation.
+                self.history = [{
+                    'role': 'user',
+                    'content': f"Start task {context.task_id}: {context.task_title}. Success condition: {success}",
+                }]
+            else:
+                # Focus changed. DON'T wipe history — that caused amnesia and made
+                # the agent re-issue calls it had already tried. Carry the rolling
+                # window forward (context.build_messages bounds what is actually
+                # sent) and just announce the new focus.
+                self.history.append({
+                    'role': 'user',
+                    'content': (
+                        f"Focus now on task {context.task_id}: {context.task_title}. "
+                        f"Success condition: {success} "
+                        "Build on what you already learned above; do not repeat calls that did not help."
+                    ),
+                    '_iteration': self._iteration + 1,
+                })
 
         self._iteration += 1
         system_prompt = self._build_system_prompt(context)
