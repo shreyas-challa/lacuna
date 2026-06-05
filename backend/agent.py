@@ -128,10 +128,10 @@ TOOL_HINTS = {
     'ffuf_fuzz': 'HINT: Ensure the URL contains the FUZZ keyword. Check the target is responding. Try filtering by response size (-fs) or status code (-fc).',
     'whatweb_scan': 'HINT: Verify the target URL/IP is correct. Try using http:// or https:// explicitly.',
     'curl_request': 'HINT: Check the URL is well-formed and the service is up. Try adding -v for verbose output or -k to skip TLS verification.',
-    'web_request': 'HINT: Use this for stateful web forms, JSON APIs, and login/invite flows. Keep a stable session_name so cookies persist across steps.',
+    'web_request': 'HINT: Use this for stateful web forms, JSON APIs, and multi-step login/registration flows. Keep a stable session_name so cookies persist across steps.',
     'download_and_analyze': 'HINT: Verify the download URL is correct and the file exists. Check HTTP response code. Try curl_request first to confirm the URL works.',
     'execute_command': 'HINT: Check command syntax. If running remote commands via SSH, verify credentials and connectivity first.',
-    'decode_text': 'HINT: Use this for base64, ROT13, or URL-decoding invite codes, tokens, and obfuscated hints instead of shell commands.',
+    'decode_text': 'HINT: Use this for base64, ROT13, or URL-decoding tokens and obfuscated values instead of shell commands.',
     'nuclei_scan': 'HINT: Ensure the target URL is correct. Try with specific templates (-t) instead of full scan. Check if nuclei templates are installed.',
     'searchsploit': 'HINT: Simplify the search query — use just the software name and version (e.g. "Apache 2.4.49"). Avoid special characters.',
     'nikto_scan': 'HINT: Verify the target URL is correct and the web server is responding. Try with -ssl flag if HTTPS.',
@@ -470,18 +470,6 @@ class Agent:
         if self.state.web_assets['api_endpoints'] or self.state.web_assets['scripts'] or self.state.web_sessions:
             plan.set_status('enum-web', 'done', evidence='Web workflow artifacts captured')
 
-        markers = self.state.workflow_markers
-        if markers.get('invite_code_obtained'):
-            plan.set_status('invite-howto', 'done', evidence=self.state.loot.get('invite_code', 'invite code recovered'))
-            if plan.get_task('invite-verify') and plan.get_task('invite-verify').status == 'pending':
-                plan.set_status('invite-verify', 'active')
-        if markers.get('invite_verified'):
-            plan.set_status('invite-verify', 'done', evidence='Invite verification succeeded')
-            if plan.get_task('invite-register') and plan.get_task('invite-register').status == 'pending':
-                plan.set_status('invite-register', 'active')
-        if markers.get('authenticated_session'):
-            plan.set_status('invite-register', 'done', evidence='Authenticated session established')
-
         if self.state.credentials:
             plan.set_status('idor-paths', 'done', evidence='Credentials recovered from web workflow')
             if plan.get_task('test-creds') and plan.get_task('test-creds').status == 'pending':
@@ -567,7 +555,6 @@ class Agent:
 
         noisy_tools = {'hydra_brute', 'gobuster_dir', 'ffuf_fuzz', 'nuclei_scan', 'nikto_scan', 'sqlmap_scan'}
         strict_tasks = {
-            'invite-howto', 'invite-verify', 'invite-register',
             'privesc-sudo', 'privesc-caps', 'privesc-suid', 'privesc-cron',
         }
         if task.id in strict_tasks and name in noisy_tools:
@@ -881,7 +868,7 @@ class Agent:
                             or self.state.accesses
                             or self.state.findings
                             or self.state.hypotheses
-                            or self.state.loot.get('invite_code')
+                            or self.state.loot
                         )
                         next_phase = 'exploitation' if has_working_path else 'complete'
                     elif exhausted_phase == 'exploitation':

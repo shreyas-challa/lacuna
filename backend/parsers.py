@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import re
 import base64
-import codecs
 import json
 
 from backend.state import StateManager
@@ -334,125 +333,40 @@ def _extract_web_workflow_artifacts(output: str, target: str, state: StateManage
         if redirect:
             state.add_note(f'Session redirect: {redirect.group(1)}')
 
-    lower_output = output.lower()
-    if 'invite code decoded:' in lower_output or 'invite_code' in lower_output:
-        state.set_workflow_marker('invite_code_obtained')
-
-    invite_paths = (
-        '/invite',
-        '/api/v1/invite/how/to/generate',
-        '/api/v1/invite/generate',
-        '/api/v1/invite/verify',
-        '/api/v1/user/register',
-        '/api/v1/user/login',
-    )
-    for path in invite_paths:
-        if path in output:
-            state.add_note(f'Invite workflow endpoint seen: {path}')
-
-    if '/api/v1/invite/how/to/generate' in output or '/api/v1/invite/generate' in output:
-        state.upsert_hypothesis(
-            'invite_workflow',
-            'This target likely requires an invite-code workflow before account creation.',
-            status='active',
-            evidence='Invite endpoints were observed in app responses or JS.',
-        )
-
-    # Scan embedded JSON objects or bare JSON responses.
+    # Generic: surface encoded values that decode to interesting tokens, without
+    # assuming any particular application workflow.
     payloads = _extract_json_payloads(output)
     for payload in payloads:
         _extract_from_json_payload(payload, state)
 
-    # Some responses are just quoted/inline encoded values.
     for encoded in re.findall(r'([A-Za-z0-9+/]{16,}={0,2})', output):
         decoded = _safe_b64decode(encoded)
-        if not decoded:
-            continue
-        if _looks_like_invite_code(decoded):
-            state.add_loot('invite_code', decoded)
-            state.set_workflow_marker('invite_code_obtained')
-            state.add_note(f'Invite code decoded: {decoded}')
-            state.add_note(f'Next step: POST code={decoded} to /api/v1/invite/verify')
-            state.upsert_hypothesis(
-                'invite_workflow',
-                'Decoded invite code is available; the next valid action is invite verification followed by registration.',
-                status='validated',
-                evidence=decoded,
-            )
-        elif '/api/v1/invite/generate' in decoded:
-            state.add_note(f'Decoded invite hint: {decoded}')
+        if decoded and _looks_like_token(decoded):
+            state.add_loot('decoded_token', decoded)
+            state.add_note(f'Decoded base64 value: {decoded}')
 
-    # ROT13 hints appear in 2million-like flows.
-    for text in re.findall(r'([A-Za-z0-9 /:._-]{20,})', output):
-        decoded = codecs.decode(text, 'rot_13')
-        if '/api/v1/invite/generate' in decoded and decoded != text:
-            state.add_note(f'Decoded ROT13 hint: {decoded}')
-
+    # Generic auth-success: a login/auth endpoint (or any request that sets a
+    # session cookie) returning 2xx/302 implies an authenticated session.
     current_url = last_url.group(1) if last_url else ''
     status_code = int(status.group(1)) if status else 0
-    body_match = re.search(r'Response Body:\n(.*)', output, re.DOTALL)
-    response_body = body_match.group(1) if body_match else output
-    response_body_lower = response_body.lower()
     success_payload = any(_payload_indicates_success(payload) for payload in payloads)
-    message_fragments = " ".join(_payload_messages(payloads)).lower()
-    if current_url.endswith('/api/v1/invite/verify') and status_code in (200, 201):
-        if (
-            success_payload
-            or '"success":1' in lower_output
-            or '"success":true' in lower_output
-            or 'invite code is valid' in response_body_lower
-            or 'invite is valid' in response_body_lower
-            or 'valid' in message_fragments
-        ):
-            state.set_workflow_marker('invite_verified')
-            state.add_note('Invite verification succeeded.')
-    if current_url.endswith('/api/v1/user/register') and status_code in (200, 201):
-        if (
-            success_payload
-            or '"success":1' in lower_output
-            or '"success":true' in lower_output
-            or 'registration successful' in response_body_lower
-            or 'account created' in response_body_lower
-            or 'registered' in message_fragments
-        ):
-            state.set_workflow_marker('account_registered')
-            state.add_note('Account registration succeeded.')
-    if current_url.endswith('/api/v1/user/login') and status_code in (200, 201, 302):
-        if (
-            success_payload
-            or '"success":1' in lower_output
-            or '"success":true' in lower_output
-            or 'login successful' in response_body_lower
-            or 'welcome' in message_fragments
-            or redirect
-            or cookie_line
-        ):
-            state.set_workflow_marker('authenticated_session')
-            state.add_note('Authenticated web session established.')
-    if current_url.endswith('/home') and status_code == 200:
-        if 'login' not in response_body_lower[:400] and 'forgot password' not in response_body_lower:
-            state.set_workflow_marker('authenticated_session')
-            state.add_note('Authenticated dashboard access confirmed.')
+    auth_url = any(
+        token in current_url.lower()
+        for token in ('login', 'signin', 'sign-in', 'authenticate', 'session', 'auth')
+    )
+    if status_code in (200, 201, 302) and (success_payload or (auth_url and (cookie_line or redirect))):
+        state.set_workflow_marker('authenticated_session')
+        state.add_note('Authenticated web session established.')
 
 
 def _extract_from_json_payload(payload: object, state: StateManager):
     if isinstance(payload, dict):
         for key, value in payload.items():
-            key_lower = str(key).lower()
             if isinstance(value, str):
                 decoded = _safe_b64decode(value)
-                if key_lower in {'data', 'code', 'invite', 'invitecode'} and decoded and _looks_like_invite_code(decoded):
-                    state.add_loot('invite_code', decoded)
-                    state.add_loot('invite_code_b64', value)
-                    state.set_workflow_marker('invite_code_obtained')
-                    state.add_note(f'Invite code decoded: {decoded}')
-                    state.add_note('Verify the invite, then register and log in.')
-                elif 'how/to/generate' in value or '/api/v1/invite/' in value:
-                    state.add_note(f'Invite API hint: {value}')
-
-                rot_decoded = codecs.decode(value, 'rot_13')
-                if '/api/v1/invite/generate' in rot_decoded and rot_decoded != value:
-                    state.add_note(f'Decoded ROT13 hint: {rot_decoded}')
+                if decoded and _looks_like_token(decoded):
+                    state.add_loot('decoded_token', decoded)
+                    state.add_note(f'Decoded value from "{key}": {decoded}')
             else:
                 _extract_from_json_payload(value, state)
     elif isinstance(payload, list):
@@ -475,7 +389,9 @@ def _safe_b64decode(value: str) -> str | None:
     return decoded
 
 
-def _looks_like_invite_code(value: str) -> bool:
+def _looks_like_token(value: str) -> bool:
+    """Heuristic for a decoded value that looks like a license/invite/API token
+    (grouped uppercase-alnum segments), regardless of the app it came from."""
     return bool(re.fullmatch(r'[A-Z0-9]{4,}(?:-[A-Z0-9]{4,}){2,}', value.strip()))
 
 

@@ -347,10 +347,8 @@ class Planner:
         web_services = [svc for svc in services if svc.get("name") in {"http", "https", "http-proxy"}]
         has_access = bool(state.get("accesses"))
         has_root = any(access.get("level") == "root" for access in state.get("accesses", []))
-        workflow_markers = set(state.get("workflow_markers", []))
         loot = state.get("loot", {})
         notes_blob = "\n".join(state.get("notes", []))
-        hypotheses = {item.get("key"): item for item in state.get("hypotheses", []) if isinstance(item, dict)}
 
         self._add_task(
             tasks,
@@ -371,39 +369,6 @@ class Planner:
                 priority=10,
                 tool_hints=["curl_request", "web_request", "gobuster_dir", "ffuf_fuzz"],
                 success="Identify an attack path, auth workflow, or download surface.",
-            )
-
-        if hypotheses.get("invite_workflow") or "invite" in notes_blob.lower():
-            self._add_task(
-                tasks,
-                "invite-howto",
-                "Resolve the invite generation workflow",
-                status="done" if "invite_code_obtained" in workflow_markers else "active",
-                priority=12,
-                parent_id="enum-web",
-                tool_hints=["curl_request", "web_request", "decode_text"],
-                success="Recover a valid invite code and the API steps required to use it.",
-            )
-            self._add_task(
-                tasks,
-                "invite-verify",
-                "Verify the invite code",
-                status="done" if "invite_verified" in workflow_markers else "active" if "invite_code_obtained" in workflow_markers else "pending",
-                priority=13,
-                parent_id="invite-howto",
-                tool_hints=["web_request"],
-                success="A verification request succeeds with the recovered invite code.",
-                evidence=[loot.get("invite_code", "")] if loot.get("invite_code") else [],
-            )
-            self._add_task(
-                tasks,
-                "invite-register",
-                "Register and log in with the recovered invite",
-                status="done" if "authenticated_session" in workflow_markers else "active" if "invite_verified" in workflow_markers else "pending",
-                priority=14,
-                parent_id="invite-verify",
-                tool_hints=["web_request"],
-                success="Authenticated session is established and stored in a named web session.",
             )
 
         numeric_paths = set()

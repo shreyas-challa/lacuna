@@ -328,7 +328,7 @@ async def download_and_analyze(url: str, filename: str) -> str:
 
 @tool(
     name='decode_text',
-    description='Decode or transform text without shell execution. Supports base64, rot13, URL decoding, and auto-detection. Use this instead of execute_command for invite codes, tokens, or obfuscated hints.',
+    description='Decode or transform text without shell execution. Supports base64, rot13, URL decoding, and auto-detection. Use this instead of execute_command for tokens or obfuscated values.',
     parameters={
         'type': 'object',
         'properties': {

@@ -212,34 +212,16 @@ class Analyzer:
         message_fragments = " ".join(_payload_messages(payloads)).lower()
         combined = f"{response_body.lower()}\n{message_fragments}\n{lower}"
 
-        if '/api/v1/invite/verify' in url:
-            if (
-                success_payload
-                or '"success":1' in combined
-                or 'invite code is valid' in combined
-                or 'invite is valid' in combined
-                or (status_code in (200, 201) and 'valid' in combined)
-            ):
-                self.state.set_workflow_marker('invite_verified')
-                self.state.add_note('Invite verification succeeded.')
-        elif '/api/v1/user/register' in url:
-            if (
-                success_payload
-                or '"success":1' in combined
-                or 'registration successful' in combined
-                or 'account created' in combined
-                or 'registered' in combined
-            ):
-                self.state.set_workflow_marker('account_registered')
-                self.state.add_note('Account registration succeeded.')
-        elif '/api/v1/user/login' in url:
-            if (
-                success_payload
-                or status_code in (200, 201, 302)
-                and any(token in combined for token in ('login', 'authenticated', 'dashboard', 'phpsessid', 'set-cookie'))
-            ):
-                self.state.set_workflow_marker('authenticated_session')
-                self.state.add_note('Authenticated web session established.')
+        # Generic auth-success: any login/auth endpoint returning 2xx/302 with a
+        # success payload or session evidence implies an authenticated session.
+        auth_url = any(token in url.lower() for token in ('login', 'signin', 'sign-in', 'authenticate', 'auth'))
+        if auth_url and (
+            success_payload
+            or (status_code in (200, 201, 302)
+                and any(token in combined for token in ('authenticated', 'dashboard', 'phpsessid', 'set-cookie', 'welcome', 'success')))
+        ):
+            self.state.set_workflow_marker('authenticated_session')
+            self.state.add_note('Authenticated web session established.')
 
     @staticmethod
     def _extract_status_code(result: str) -> int:

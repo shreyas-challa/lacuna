@@ -76,25 +76,15 @@ class OutputProcessor:
             notable.append(f"Numeric object paths: {', '.join(numeric_paths[:4])}")
         if downloads:
             notable.append(f"Download paths: {', '.join(downloads[:4])}")
-        if "invite" in result.lower():
-            notable.append("Invite-based workflow evidence detected.")
         if "set-cookie" in result.lower() or re.search(r"(?m)^Cookies:\s+\S", result):
             notable.append("Session cookies were observed.")
 
         lower = result.lower()
         milestone_follow_up = ""
-        if "/api/v1/invite/verify" in url and (
-            '"success":1' in lower or '"success":true' in lower or 'invite code is valid' in lower
-        ):
-            notable.append("Invite verification succeeded.")
-            milestone_follow_up = "Proceed to registration using the verified invite and the same web session."
-        elif "/api/v1/user/register" in url and (
-            '"success":1' in lower or '"success":true' in lower or 'registration successful' in lower
-        ):
-            notable.append("Account registration succeeded.")
-            milestone_follow_up = "Log in immediately and preserve the authenticated session."
-        elif "/api/v1/user/login" in url and (
-            '"success":1' in lower or '"success":true' in lower or 'login successful' in lower or 'set-cookie' in lower
+        auth_url = any(token in url.lower() for token in ("login", "signin", "sign-in", "authenticate", "auth"))
+        if auth_url and (
+            '"success":1' in lower or '"success":true' in lower
+            or 'login successful' in lower or 'set-cookie' in lower
         ):
             notable.append("Authenticated session established.")
             milestone_follow_up = "Enumerate authenticated application features and privileged endpoints next."
@@ -104,7 +94,7 @@ class OutputProcessor:
         if api_paths:
             summary += f" Found {len(api_paths)} API endpoint hint(s)."
         significance = "medium"
-        if numeric_paths or downloads or "invite" in result.lower():
+        if numeric_paths or downloads:
             significance = "high"
         return ProcessedOutput(
             summary=summary,
