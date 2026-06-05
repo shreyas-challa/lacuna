@@ -1,13 +1,7 @@
-// D3.js force-directed attack graph — Phosphor theme
+// D3.js force-directed attack graph — palette driven by CSS design tokens.
 
 const GraphViz = (() => {
-  const NODE_COLORS = {
-    machine: '#e8a634',
-    service: '#22c55e',
-    user: '#eab308',
-    vulnerability: '#f97316',
-    root: '#ef4444',
-  };
+  const TYPES = ['machine', 'service', 'user', 'vulnerability', 'root'];
 
   const NODE_ICONS = {
     machine: 'M',
@@ -22,9 +16,29 @@ const GraphViz = (() => {
 
   let svg, defs, container, simulation;
   let nodeGroup, linkGroup, labelGroup, linkLabelGroup;
+  let bgRect, dotCircle;
   let currentNodes = [];
   let currentLinks = [];
   let nodeCount = 0;
+  const filterFloods = {};
+
+  // Read live values from the CSS custom properties so the graph
+  // always matches the active (light/dark) theme.
+  function cssVar(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+  function nodeColors() {
+    return {
+      machine: cssVar('--viz-machine'),
+      service: cssVar('--viz-service'),
+      user: cssVar('--viz-user'),
+      vulnerability: cssVar('--viz-vuln'),
+      root: cssVar('--viz-root'),
+    };
+  }
+  function colorFor(type, colors) {
+    return (colors || nodeColors())[type] || cssVar('--viz-machine');
+  }
 
   function init() {
     svg = d3.select('#graph-svg');
@@ -37,20 +51,20 @@ const GraphViz = (() => {
     // Dot grid pattern
     const pattern = defs.append('pattern')
       .attr('id', 'dot-grid')
-      .attr('width', 20)
-      .attr('height', 20)
+      .attr('width', 22)
+      .attr('height', 22)
       .attr('patternUnits', 'userSpaceOnUse');
-    pattern.append('circle')
-      .attr('cx', 10)
-      .attr('cy', 10)
-      .attr('r', 0.8)
-      .attr('fill', '#1a1a1a');
+    dotCircle = pattern.append('circle')
+      .attr('cx', 11)
+      .attr('cy', 11)
+      .attr('r', 0.9)
+      .attr('fill', cssVar('--graph-dot'));
 
-    // Background rect with dot grid
-    svg.insert('rect', ':first-child')
+    // Background
+    bgRect = svg.insert('rect', ':first-child')
       .attr('width', '100%')
       .attr('height', '100%')
-      .attr('fill', '#0c0c0c');
+      .attr('fill', cssVar('--graph-bg'));
     svg.insert('rect', 'g')
       .attr('width', '100%')
       .attr('height', '100%')
@@ -67,10 +81,11 @@ const GraphViz = (() => {
       .attr('orient', 'auto')
       .append('path')
       .attr('d', 'M0,-4L8,0L0,4')
-      .attr('fill', '#2a2a2a');
+      .attr('fill', cssVar('--graph-link'));
 
     // Glow filters per type
-    Object.entries(NODE_COLORS).forEach(([type, color]) => {
+    const colors = nodeColors();
+    TYPES.forEach((type) => {
       const filter = defs.append('filter')
         .attr('id', `glow-${type}`)
         .attr('x', '-50%').attr('y', '-50%')
@@ -79,9 +94,9 @@ const GraphViz = (() => {
         .attr('in', 'SourceGraphic')
         .attr('stdDeviation', '3')
         .attr('result', 'blur');
-      filter.append('feFlood')
-        .attr('flood-color', color)
-        .attr('flood-opacity', '0.4')
+      filterFloods[type] = filter.append('feFlood')
+        .attr('flood-color', colors[type])
+        .attr('flood-opacity', '0.45')
         .attr('result', 'color');
       filter.append('feComposite')
         .attr('in', 'color')
@@ -96,13 +111,10 @@ const GraphViz = (() => {
     // Zoom
     const zoom = d3.zoom()
       .scaleExtent([0.2, 4])
-      .on('zoom', (event) => {
-        container.attr('transform', event.transform);
-      });
+      .on('zoom', (event) => container.attr('transform', event.transform));
     svg.call(zoom);
 
     container = svg.append('g');
-
     linkGroup = container.append('g').attr('class', 'links');
     linkLabelGroup = container.append('g').attr('class', 'link-labels');
     nodeGroup = container.append('g').attr('class', 'nodes');
@@ -138,6 +150,9 @@ const GraphViz = (() => {
   }
 
   function update(nodes, edges) {
+    const colors = nodeColors();
+    const nodeStroke = cssVar('--node-stroke');
+
     // Preserve existing positions
     const posMap = {};
     currentNodes.forEach(n => { posMap[n.id] = { x: n.x, y: n.y, vx: n.vx, vy: n.vy }; });
@@ -172,29 +187,26 @@ const GraphViz = (() => {
       .attr('cursor', 'grab')
       .call(drag(simulation));
 
-    // Outer glow ring
     nodeEnter.append('circle')
       .attr('class', 'node-glow')
       .attr('r', 0)
-      .attr('stroke', d => NODE_COLORS[d.type] || '#e8a634')
+      .attr('stroke', d => colorFor(d.type, colors))
       .attr('stroke-width', 1.5)
       .attr('filter', d => `url(#glow-${d.type || 'machine'})`)
       .transition().duration(500)
       .ease(d3.easeElasticOut.amplitude(1).period(0.4))
       .attr('r', GLOW_RADIUS);
 
-    // Inner filled circle
     nodeEnter.append('circle')
       .attr('class', 'node-fill')
       .attr('r', 0)
-      .attr('fill', d => NODE_COLORS[d.type] || '#e8a634')
-      .attr('stroke', '#0c0c0c')
+      .attr('fill', d => colorFor(d.type, colors))
+      .attr('stroke', nodeStroke)
       .attr('stroke-width', 2)
       .transition().duration(500)
       .ease(d3.easeElasticOut.amplitude(1).period(0.4))
       .attr('r', NODE_RADIUS);
 
-    // Type icon letter
     nodeEnter.append('text')
       .attr('class', 'node-icon')
       .text(d => NODE_ICONS[d.type] || '?')
@@ -204,10 +216,11 @@ const GraphViz = (() => {
 
     // Update existing node colors
     nodeG.select('.node-glow')
-      .attr('stroke', d => NODE_COLORS[d.type] || '#e8a634')
+      .attr('stroke', d => colorFor(d.type, colors))
       .attr('filter', d => `url(#glow-${d.type || 'machine'})`);
     nodeG.select('.node-fill')
-      .attr('fill', d => NODE_COLORS[d.type] || '#e8a634');
+      .attr('fill', d => colorFor(d.type, colors))
+      .attr('stroke', nodeStroke);
     nodeG.select('.node-icon')
       .text(d => NODE_ICONS[d.type] || '?');
 
@@ -219,40 +232,51 @@ const GraphViz = (() => {
       .text(d => d.label || d.id);
     label.text(d => d.label || d.id);
 
-    // Update node count
     nodeCount = currentNodes.length;
 
-    // Restart simulation
     simulation.nodes(currentNodes);
     simulation.force('link').links(currentLinks);
     simulation.alpha(0.3).restart();
   }
 
-  function getNodeCount() {
-    return nodeCount;
+  // Re-read the CSS tokens and recolor everything (called on theme toggle).
+  function restyle() {
+    if (!svg) return;
+    const colors = nodeColors();
+    const nodeStroke = cssVar('--node-stroke');
+
+    if (bgRect) bgRect.attr('fill', cssVar('--graph-bg'));
+    if (dotCircle) dotCircle.attr('fill', cssVar('--graph-dot'));
+    defs.select('#arrow path').attr('fill', cssVar('--graph-link'));
+
+    TYPES.forEach((type) => {
+      if (filterFloods[type]) filterFloods[type].attr('flood-color', colors[type]);
+    });
+
+    nodeGroup.selectAll('g.node-group').select('.node-glow')
+      .attr('stroke', d => colorFor(d.type, colors));
+    nodeGroup.selectAll('g.node-group').select('.node-fill')
+      .attr('fill', d => colorFor(d.type, colors))
+      .attr('stroke', nodeStroke);
   }
 
-  function getNodes() {
-    return currentNodes;
-  }
+  function getNodeCount() { return nodeCount; }
+  function getNodes() { return currentNodes; }
 
   function drag(sim) {
     return d3.drag()
       .on('start', (event, d) => {
         if (!event.active) sim.alphaTarget(0.3).restart();
-        d.fx = d.x;
-        d.fy = d.y;
+        d.fx = d.x; d.fy = d.y;
       })
       .on('drag', (event, d) => {
-        d.fx = event.x;
-        d.fy = event.y;
+        d.fx = event.x; d.fy = event.y;
       })
       .on('end', (event, d) => {
         if (!event.active) sim.alphaTarget(0);
-        d.fx = null;
-        d.fy = null;
+        d.fx = null; d.fy = null;
       });
   }
 
-  return { init, update, getNodeCount, getNodes };
+  return { init, update, restyle, getNodeCount, getNodes };
 })();

@@ -1,9 +1,19 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Lacuna — Security Research Agent</title>
+  <!-- Set theme before paint to avoid flash -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('lacuna-theme');
+        if (t === 'light') document.documentElement.classList.remove('dark');
+        else document.documentElement.classList.add('dark');
+      } catch (e) { document.documentElement.classList.add('dark'); }
+    })();
+  </script>
   <link rel="stylesheet" href="/static/style.css">
   <script src="https://d3js.org/d3.v7.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -11,7 +21,15 @@
 <body>
   <!-- Status bar -->
   <header id="status-bar">
-    <div class="logo">LACUNA</div>
+    <div class="logo">
+      <span class="logo-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        </svg>
+      </span>
+      <span class="logo-text">LACUNA</span>
+    </div>
+
     <div id="phase-stepper">
       <div class="phase-dot active" data-phase="recon"><span class="phase-label-text">RECON</span></div>
       <div class="phase-connector"></div>
@@ -19,7 +37,20 @@
       <div class="phase-connector"></div>
       <div class="phase-dot" data-phase="escalate"><span class="phase-label-text">PRIVESC</span></div>
     </div>
-    <div id="status-text">IDLE</div>
+
+    <div class="status-cluster">
+      <span id="status-dot" class="status-dot"></span>
+      <span id="status-text">IDLE</span>
+    </div>
+
+    <button id="theme-toggle" class="icon-button" title="Toggle theme" aria-label="Toggle theme">
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+      </svg>
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+      </svg>
+    </button>
   </header>
 
   <!-- Main content -->
@@ -27,33 +58,49 @@
     <div id="graph-container">
       <svg id="graph-svg"></svg>
       <div id="graph-legend">
-        <div class="legend-item"><span class="legend-swatch" style="background:#e8a634"></span>Machine</div>
-        <div class="legend-item"><span class="legend-swatch" style="background:#22c55e"></span>Service</div>
-        <div class="legend-item"><span class="legend-swatch" style="background:#eab308"></span>User</div>
-        <div class="legend-item"><span class="legend-swatch" style="background:#f97316"></span>Vuln</div>
-        <div class="legend-item"><span class="legend-swatch" style="background:#ef4444"></span>Root</div>
+        <div class="legend-item"><span class="legend-swatch" data-type="machine"></span>Machine</div>
+        <div class="legend-item"><span class="legend-swatch" data-type="service"></span>Service</div>
+        <div class="legend-item"><span class="legend-swatch" data-type="user"></span>User</div>
+        <div class="legend-item"><span class="legend-swatch" data-type="vulnerability"></span>Vuln</div>
+        <div class="legend-item"><span class="legend-swatch" data-type="root"></span>Root</div>
       </div>
     </div>
 
     <div id="panel">
       <div class="panel-tabs">
-        <button class="tab active" data-tab="tools">Activity</button>
-        <button class="tab" data-tab="report">Report</button>
-        <button class="tab" data-tab="intel">Intel</button>
-        <button class="tab" data-tab="sessions">Sessions</button>
+        <button class="tab active" data-tab="tools">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+          <span>Activity</span>
+        </button>
+        <button class="tab" data-tab="report">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+          <span>Report</span>
+        </button>
+        <button class="tab" data-tab="intel">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+          <span>Intel</span>
+        </button>
+        <button class="tab" data-tab="sessions">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6-6-6M12 19h8"/></svg>
+          <span>Sessions</span>
+        </button>
       </div>
+
       <div id="tools-panel" class="panel-content active">
         <div id="tool-log"></div>
       </div>
       <div id="report-panel" class="panel-content">
-        <div id="report-content"></div>
+        <div id="report-content" class="report-empty">Report will render here once the engagement produces findings.</div>
       </div>
       <div id="intel-panel" class="panel-content">
         <div id="strategy-section"></div>
         <div id="intel-content"></div>
       </div>
       <div id="sessions-panel" class="panel-content">
-        <div id="sessions-empty" class="sessions-empty">No active sessions. Shells will appear here when the agent gains access.</div>
+        <div id="sessions-empty" class="sessions-empty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6-6-6M12 19h8"/></svg>
+          <span>No active sessions. Shells appear here when the agent gains access.</span>
+        </div>
         <div id="sessions-list"></div>
       </div>
     </div>
@@ -72,7 +119,10 @@
         <input type="text" id="lhost-input" placeholder="10.10.14.5" spellcheck="false">
         <span id="lhost-validation" class="validation-icon"></span>
       </div>
-      <button id="engage-btn">ENGAGE</button>
+      <button id="engage-btn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9z"/></svg>
+        <span>ENGAGE</span>
+      </button>
     </div>
     <div id="metrics-section" class="hidden">
       <div class="metric"><span class="metric-label">TIME</span><span id="metric-time" class="metric-value">00:00</span></div>
@@ -83,6 +133,7 @@
     </div>
   </footer>
 
+  <script src="/static/theme.js"></script>
   <script src="/static/graph.js"></script>
   <script src="/static/toolpanel.js"></script>
   <script src="/static/report.js"></script>

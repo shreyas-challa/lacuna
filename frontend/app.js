@@ -7,7 +7,14 @@
   const targetValidation = document.getElementById('target-validation');
   const lhostValidation = document.getElementById('lhost-validation');
   const statusText = document.getElementById('status-text');
+  const statusDot = document.getElementById('status-dot');
   const inputSection = document.getElementById('input-section');
+
+  // Drive the status pill text + indicator dot together.
+  function setStatus(text, state) {
+    statusText.textContent = text;
+    if (statusDot) statusDot.className = 'status-dot' + (state ? ' ' + state : '');
+  }
   const metricsSection = document.getElementById('metrics-section');
   const metricTime = document.getElementById('metric-time');
   const metricTools = document.getElementById('metric-tools');
@@ -171,7 +178,7 @@
     if (lhost && validateIP(lhost) === false) return;
 
     engageBtn.disabled = true;
-    statusText.textContent = 'CONNECTING';
+    setStatus('CONNECTING', 'live');
 
     showMetrics(target);
     startTimer();
@@ -183,7 +190,7 @@
 
     ws.onopen = () => {
       ws.send(JSON.stringify({ target, lhost }));
-      statusText.textContent = 'ENGAGED';
+      setStatus('ENGAGED', 'live');
     };
 
     ws.onmessage = (event) => {
@@ -193,14 +200,14 @@
     };
 
     ws.onclose = () => {
-      statusText.textContent = 'DISCONNECTED';
+      setStatus('DISCONNECTED', null);
       stopTimer();
       engageBtn.disabled = false;
       showInputs();
     };
 
     ws.onerror = () => {
-      statusText.textContent = 'ERROR';
+      setStatus('ERROR', 'error');
       stopTimer();
       engageBtn.disabled = false;
       showInputs();
@@ -229,7 +236,7 @@
           setPhase(idx);
           ToolPanel.setPhase(PHASES[idx]);
         }
-        statusText.textContent = phaseName.toUpperCase();
+        setStatus(phaseName.toUpperCase(), 'live');
         break;
       }
 
@@ -257,7 +264,7 @@
         break;
 
       case 'complete':
-        statusText.textContent = 'COMPLETE';
+        setStatus('COMPLETE', 'done');
         phaseDots.forEach(d => { d.classList.remove('active'); d.classList.add('completed'); });
         phaseConnectors.forEach(c => c.classList.add('completed'));
         stopTimer();
@@ -265,7 +272,7 @@
         break;
 
       case 'error':
-        statusText.textContent = 'ERROR';
+        setStatus('ERROR', 'error');
         ToolPanel.addThinking('Error: ' + (msg.data.message || 'Unknown error'));
         stopTimer();
         engageBtn.disabled = false;
