@@ -26,7 +26,7 @@ load_dotenv()
 OPENAI_MODEL = os.getenv("LACUNA_MODEL", "gpt-4.1-mini")
 CODEX_MODEL = os.getenv("LACUNA_CODEX_MODEL", "") or "gpt-5.1-codex-mini"
 ANTHROPIC_MODEL = os.getenv("LACUNA_ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-MINIMAX_MODEL = os.getenv("LACUNA_MINIMAX_MODEL", "MiniMax-M2.7")
+MINIMAX_MODEL = os.getenv("LACUNA_MINIMAX_MODEL", "MiniMax-M3")
 FALLBACK_ENABLED = os.getenv("LACUNA_FALLBACK", "true").lower() in ("true", "1", "yes")
 
 MAX_RETRIES = 3
@@ -81,7 +81,8 @@ MODEL_PRICING = {
     'claude-opus-4':   {'input': 15.00, 'output': 75.00, 'cached_input': 1.875},
     'claude-sonnet-4': {'input': 3.00,  'output': 15.00, 'cached_input': 0.375},
     'claude-haiku-4':  {'input': 0.80,  'output': 4.00,  'cached_input': 0.10},
-    # MiniMax
+    # MiniMax (standard pay-go rates; a subscription token plan is billed separately)
+    'MiniMax-M3':      {'input': 0.60,  'output': 2.40,  'cached_input': 0.15},
     'MiniMax-M2.7':    {'input': 0.30,  'output': 1.20,  'cached_input': 0.075},
     'MiniMax-M2.5':    {'input': 0.30,  'output': 1.20,  'cached_input': 0.075},
 }

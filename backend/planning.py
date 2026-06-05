@@ -479,7 +479,7 @@ class Planner:
     @staticmethod
     def _default_planner_model() -> str:
         if os.getenv("MINIMAX_API_KEY"):
-            return os.getenv("LACUNA_MINIMAX_MODEL", "").strip() or "MiniMax-M2.7"
+            return os.getenv("LACUNA_MINIMAX_MODEL", "").strip() or "MiniMax-M3"
         return ""
 
     @staticmethod
