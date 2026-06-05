@@ -44,6 +44,28 @@ def _find_wordlist(name: str = 'common') -> str | None:
 DEFAULT_WORDLIST = _find_wordlist('common') or '/usr/share/seclists/Discovery/Web-Content/common.txt'
 
 
+def _collapse_value_flags(flags: str, names: tuple[str, ...]) -> str:
+    """Keep only the first occurrence of each value-taking flag (flag + value),
+    dropping later duplicates and their values."""
+    parts = flags.split()
+    name_set = set(names)
+    out: list[str] = []
+    seen: set[str] = set()
+    i = 0
+    while i < len(parts):
+        token = parts[i]
+        if token in name_set:
+            if token not in seen and i + 1 < len(parts):
+                out.append(token)
+                out.append(parts[i + 1])
+                seen.add(token)
+            i += 2
+            continue
+        out.append(token)
+        i += 1
+    return ' '.join(out)
+
+
 def _dedupe_flags(flags: str) -> str:
     seen = []
     for part in flags.split():
@@ -54,20 +76,46 @@ def _dedupe_flags(flags: str) -> str:
 
 def _sanitize_nmap_flags(flags: str) -> str:
     flags = re.sub(r'\s+', ' ', (flags or '').strip())
-    if not flags:
-        flags = '-sV -sC'
 
-    # Full-port scans are often worthwhile on HTB, but they should be bounded.
+    # Strip output-file flags (-oN/-oX/-oG/-oS/-oA <path>). The tool already
+    # captures stdout; these only make the model fight non-existent directories.
+    flags = re.sub(r'\s*-o[NXGSA]\s+\S+', '', flags)
+    # Strip --host-timeout: it aborts the host and discards all results found so
+    # far. The tool-level timeout already bounds wall-clock.
+    flags = re.sub(r'\s*--host-timeout\s+\S+', '', flags)
+    # We run unprivileged: UDP/SYN/raw-socket scans fail or need root.
+    flags = re.sub(r'\s*-sU\b', '', flags)            # UDP: needs root + very slow
+    flags = re.sub(r'\s*-sS\b', ' -sT', flags)        # SYN -> connect scan (unprivileged)
+    flags = re.sub(r'\s*-s[AWMNFXO]\b', '', flags)    # ACK/Window/Maimon/raw scans need root
+    flags = re.sub(r'\s+', ' ', flags).strip()
+
+    # Collapse duplicate value-taking flags (keep first + its value) so a stray
+    # second "--min-rate 2000" can't leave an orphaned "2000" arg that nmap then
+    # treats as a (broken) target.
+    flags = _collapse_value_flags(flags, ('--min-rate', '--max-retries', '--max-rate', '--scan-delay'))
+
+    if not flags:
+        flags = '-sV -sC -T4'
+
     is_full_scan = '-p-' in flags or '--top-ports' in flags or '-A' in flags
     if is_full_scan:
-        if '--host-timeout' not in flags:
-            flags += ' --host-timeout 90s'
+        # Bound for speed via rate, NOT --host-timeout: host-timeout aborts the
+        # whole host and discards every port found so far (the "no ports / keeps
+        # timing out" failure). Let the tool-level timeout cap wall-clock instead.
+        if '--min-rate' not in flags:
+            flags += ' --min-rate 1000'
         if '--max-retries' not in flags:
             flags += ' --max-retries 2'
-        if '--min-rate' not in flags:
-            flags += ' --min-rate 2000'
-        if '-n' not in flags:
+        if '-T' not in flags:
+            flags += ' -T4'
+        if ' -n' not in f' {flags}':
             flags += ' -n'
+    else:
+        # Default scan: make sure we actually get versions + default scripts.
+        if not any(tok in flags for tok in ('-sV', '-sC', '-sCV', '-A')):
+            flags += ' -sV -sC'
+        if '-T' not in flags:
+            flags += ' -T4'
 
     return _dedupe_flags(flags)
 
@@ -114,8 +162,20 @@ def _sanitize_curl_flags(flags: str) -> str:
 )
 async def nmap_scan(target: str, flags: str = '-sV -sC') -> str:
     safe_flags = _sanitize_nmap_flags(flags)
-    timeout = 120 if '-p-' in safe_flags or '--top-ports' in safe_flags or '-A' in safe_flags else 60
-    return await run_command(f'nmap {safe_flags} {target}', timeout=timeout)
+    # Be patient: a full/heavy scan is the money scan — give it room to finish
+    # rather than aborting and reporting nothing.
+    is_heavy = '-p-' in safe_flags or '--top-ports' in safe_flags or '-A' in safe_flags
+    timeout = 300 if is_heavy else 120
+    result = await run_command(f'nmap {safe_flags} {target}', timeout=timeout)
+    # Surface a clear, actionable message when nothing came back so the model
+    # adjusts instead of blindly retrying the same scan.
+    if result.startswith('[TIMEOUT'):
+        return (f"{result} — nmap did not finish in {timeout}s. Narrow the scope "
+                f"(e.g. scan specific ports with -p 21,22,80) rather than re-running a full scan.")
+    if 'open' not in result and 'Nmap scan report' in result:
+        return (f"{result}\n\n[NOTE] No open ports reported. Try '-Pn' (host may block ping) "
+                f"or a connect scan '-sT', and give it time before changing approach.")
+    return result
 
 
 @tool(

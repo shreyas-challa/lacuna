@@ -230,10 +230,8 @@ def sanitize_tool_args(name: str, args: dict, context: dict | None = None) -> tu
         if '-A' in flags and '-sV' not in flags and '-sC' not in flags:
             sanitized['flags'] = flags.replace('-A', '-sV -sC').strip()
             note = 'Replaced -A with -sV -sC to avoid slow OS/scripts spray.'
-        flags = str(sanitized.get('flags', '') or '').strip()
-        if '-p-' in flags and '--host-timeout' not in flags:
-            sanitized['flags'] = f'{flags} --host-timeout 90s --max-retries 2 --min-rate 2000 -n'.strip()
-            note = 'Bounded full-port nmap scan to avoid 5-minute stalls.'
+        # Full-scan bounding is handled inside nmap_scan/_sanitize_nmap_flags now
+        # (rate-limited, no --host-timeout) so we don't abort and discard results.
 
     elif name == 'gobuster_dir':
         flags = str(sanitized.get('flags', '') or '')
