@@ -2,20 +2,24 @@
 
 Discover the attack surface and identify vulnerabilities. Time is the enemy — don't over-enumerate.
 
-### Priority Order
-1. **Port scan**: start with `nmap -sV -sC -T4`
-2. If the host appears down, retry with `-Pn`
-3. Only use `-p-` if the first scan is insufficient, and keep it bounded and fast
-4. **Web recon first**: if HTTP is open, fetch `/`, inspect discovered links/assets, and follow application-specific paths immediately
-5. **Downloadable files**: if the app exposes downloads (pcap, logs, exports, configs), use `download_and_analyze` before brute force
-6. **IDOR first**: numeric IDs, `/data/`, `/download/`, `/capture/`, `/export/` are higher-priority than gobuster
-7. **Targeted content discovery**: use `gobuster_dir` with `wordlist="common"` and no extensions first; only broaden scope if the app structure is still unclear
-8. **Vuln scanning**: use nuclei (`-severity critical,high`), searchsploit for service versions, or nikto for web servers
-9. **Credential brute-force**: use hydra_brute as a true last resort when you have a strong username hypothesis and no better app path
-10. **Check known exploits**: The system auto-matches discovered services against the knowledge base. If a match appears, go straight to exploitation.
-11. **FTP check**: If FTP is open, check for anonymous access
-12. **SQL injection**: If web forms/params exist, try sqlmap_scan
-13. **WordPress**: If WordPress detected, use wpscan
+### Port scanning (nmap) — do this right
+- **One scan at a time, then WAIT for the result.** Do not fire several nmap calls in parallel — you cannot act on output you haven't read yet, and it wastes the budget.
+- **First scan:** `nmap_scan` with `flags="-sV -sC"` (default top-1000 ports). This finds most services in seconds.
+- If the host appears down / no ports, retry once with `-Pn` (HTB often blocks ping). Be patient — a scan can take a minute or two; that is normal, not a failure.
+- Only after reviewing the first scan, run a full-port scan with `flags="-p-"` if you suspect a service on a high port. The tool bounds it automatically.
+- **Do NOT**: write output to files (`-oN/-oX`), run UDP (`-sU`) or SYN (`-sS`) scans (no root), or pass `--host-timeout`. The tool strips these; just request the scan type you want.
+
+### Priority Order (after the port scan)
+1. **Web recon first**: if HTTP is open, fetch `/`, inspect discovered links/assets, and follow application-specific paths immediately
+2. **FTP check**: if FTP is open, check for anonymous access right away
+3. **Downloadable files**: if the app exposes downloads (pcap, logs, exports, configs), use `download_and_analyze` before brute force
+4. **IDOR first**: numeric IDs, `/data/`, `/download/`, `/capture/`, `/export/` are higher-priority than gobuster
+5. **Targeted content discovery**: use `gobuster_dir` with `wordlist="common"` and no extensions first; only broaden scope if the app structure is still unclear
+6. **Vuln scanning**: use nuclei (`-severity critical,high`), searchsploit for service versions, or nikto for web servers (only if installed)
+7. **Credential brute-force**: use hydra_brute as a true last resort when you have a strong username hypothesis and no better app path
+8. **Check known exploits**: the system auto-matches discovered services against the knowledge base. If a match appears, go straight to exploitation.
+9. **SQL injection**: if web forms/params exist, try sqlmap_scan
+10. **WordPress**: if WordPress detected, use wpscan
 
 ### Knowledge Base
 Use `query_kb` to instantly look up:
