@@ -335,7 +335,8 @@ class Planner:
             tools=None,
             backend_override=self.backend_override,
             model_override=self.model_override,
-            max_tokens=2200,
+            max_tokens=3500,
+            temperature=0.2,
         )
 
     def _build_template_plan(self, phase: str, state: dict, memory: dict) -> AttackPlan:

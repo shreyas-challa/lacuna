@@ -12,6 +12,13 @@ from backend.llm import chat_completion, extract_usage
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
+# Reasoning models (e.g. MiniMax M2.x/M3) emit a <think> block before the tool
+# call; too small a cap truncates the response BEFORE the tool call is emitted,
+# which the loop then misreads as "no action". Give generous headroom.
+OPERATOR_MAX_TOKENS = int(os.getenv("LACUNA_OPERATOR_MAX_TOKENS", "5000"))
+# Low temperature → precise tool arguments. High randomness hurts agentic tool use.
+OPERATOR_TEMPERATURE = float(os.getenv("LACUNA_OPERATOR_TEMPERATURE", "0.3"))
+
 
 @dataclass
 class OperatorTaskContext:
@@ -74,7 +81,8 @@ class Operator:
             tools,
             backend_override=self.backend_override,
             model_override=self.model_override,
-            max_tokens=1800,
+            max_tokens=OPERATOR_MAX_TOKENS,
+            temperature=OPERATOR_TEMPERATURE,
         )
         message = response.choices[0].message
         assistant_msg = {'role': 'assistant', 'content': message.content or '', '_iteration': self._iteration}
