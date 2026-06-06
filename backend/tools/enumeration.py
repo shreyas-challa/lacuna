@@ -1,11 +1,16 @@
 import os
 import re
+import shutil
 import ipaddress
 import base64
 import codecs
 from urllib.parse import unquote
 from backend.tools.base import tool, run_command
 from backend.knowledge import query_knowledge_base
+
+# Force line-buffering for streaming tools so partial output flushes (and is
+# preserved on timeout) instead of sitting in a block buffer until completion.
+_STREAM_PREFIX = 'stdbuf -oL -eL ' if shutil.which('stdbuf') else ''
 
 # ── Wordlist paths (order of preference) ──────────────────────
 _WORDLIST_SEARCH_PATHS = {
@@ -241,7 +246,7 @@ async def gobuster_dir(url: str, wordlist: str = '', flags: str = '') -> str:
     if '-s ' not in flags and '--status-codes' not in flags:
         base_flags += ' -b 404'
     safe_flags = _sanitize_gobuster_flags(flags)
-    result = await run_command(f'gobuster dir -u {url} -w {wl} {base_flags} {safe_flags}', timeout=90)
+    result = await run_command(f'{_STREAM_PREFIX}gobuster dir -u {url} -w {wl} {base_flags} {safe_flags}', timeout=150)
     # Detect gobuster wildcard/error abort
     if 'the server returns a status code that matches' in result or 'Wildcard response found' in result.lower():
         return (
@@ -276,7 +281,7 @@ async def ffuf_fuzz(url: str, wordlist: str = '', flags: str = '') -> str:
     if '-fc' not in flags and '-fs' not in flags and '-ac' not in flags:
         auto_flags += ' -ac'  # auto-calibrate: ffuf detects and filters wildcard sizes
     safe_flags = _sanitize_ffuf_flags(flags)
-    return await run_command(f'ffuf -u {url} -w {wl} {auto_flags} {safe_flags}', timeout=90)
+    return await run_command(f'{_STREAM_PREFIX}ffuf -u {url} -w {wl} {auto_flags} {safe_flags}', timeout=150)
 
 
 @tool(
