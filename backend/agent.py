@@ -1324,6 +1324,14 @@ class Agent:
                                         result = f"{result}\n\n{curl_feedback}"
                                     else:
                                         result = await self._execute_tool(name, args)
+                        elif name == 'curl_request':
+                            dl_tool, dl_args, dl_note = self._check_download_redirect(args)
+                            if dl_tool:
+                                L.log(f"{C_YELLOW}Redirecting curl_request(-o) -> {dl_tool}{C_RESET}")
+                                result = await self._execute_tool(dl_tool, dl_args)
+                                result = f"{dl_note}\n\n[REDIRECTED to {dl_tool}] {result}"
+                            else:
+                                result = await self._execute_tool(name, args)
                         else:
                             result = await self._execute_tool(name, args)
                         tool_time = time.time() - tool_start
@@ -1590,6 +1598,28 @@ class Agent:
                 'follow_redirects': follow_redirects,
             },
             '[NOTE] Redirected stateful curl to web_request so cookies, redirects, headers, and body are preserved structurally.',
+        )
+
+    def _check_download_redirect(self, args: dict) -> tuple[str | None, dict | None, str | None]:
+        """Route curl_request(-o/--output FILE) to download_and_analyze.
+
+        `curl -o` just drops a file in /tmp the model can't read back, so it
+        tends to download the same artifact twice (once with curl -o, once via
+        download_and_analyze). Redirecting consolidates fetch responsibility and
+        actually analyzes the file (pcap→tshark, binary→strings). The filename
+        (and its extension, which drives analysis) is taken from the -o value."""
+        flags = str(args.get('flags', '') or '')
+        url = str(args.get('url', '') or '')
+        m = re.search(r'(?:-o|--output)\s+(\S+)', flags)
+        if not m or not url:
+            return None, None, None
+        out = m.group(1).strip().strip("'\"")
+        filename = out.rsplit('/', 1)[-1] or 'download.bin'
+        return (
+            'download_and_analyze',
+            {'url': url, 'filename': filename},
+            '[NOTE] curl -o only saves a file you cannot inspect; routed to '
+            'download_and_analyze, which downloads AND analyzes it (pcap/strings/text).',
         )
 
     def _check_curl_redirect(self, args: dict) -> tuple[str | None, dict | None, str | None]:
