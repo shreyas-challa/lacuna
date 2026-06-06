@@ -55,10 +55,11 @@ class Analyzer:
             refresh_required = refresh_required or state_changed
 
         parsed = None
+        ctx = self._graph_context(name, args)
         if name in TOOL_PARSERS and not result.startswith('[ERROR]') and not result.startswith('[TIMEOUT'):
-            parsed = TOOL_PARSERS[name](result, self.target)
+            parsed = TOOL_PARSERS[name](result, self.target, ctx)
         elif name in ('execute_command', 'download_and_analyze') and not result.startswith('[ERROR]'):
-            parsed = _parse_command_output_for_graph(result, self.target)
+            parsed = _parse_command_output_for_graph(result, self.target, ctx)
         if parsed and (parsed['nodes'] or parsed['edges']):
             before_nodes = len(self.graph.nodes)
             before_edges = len(self.graph.edges)
@@ -105,6 +106,72 @@ class Analyzer:
             web_assets_added=web_assets_added,
             state_changed=state_changed,
         )
+
+    def _graph_context(self, name: str, args: dict) -> dict:
+        """Compute provenance for graph edges so findings chain off the artifact
+        that produced them, not the machine node. Builds the web spine
+        (machine → service → endpoint → downloaded file) and identifies the
+        foothold user/credential for privesc chaining."""
+        ctx: dict = {'source_id': self.target, 'foothold_user_id': None, 'foothold_cred_id': None}
+
+        url = str(args.get('url', '') or '')
+        if url.startswith(('http://', 'https://')):
+            spine = self._ensure_web_spine(name, url, args)
+            if spine:
+                ctx['source_id'] = spine
+
+        # Foothold: a credential already verified for a shell service lets us
+        # chain privesc findings (root, cap_setuid) off the user we logged in as.
+        for cred in self.state.credentials.values():
+            if any(svc in cred.verified_for for svc in ('ssh', 'winrm', 'rdp')):
+                ctx['foothold_cred_id'] = f'cred-{cred.password[:30]}'
+                ctx['foothold_user_id'] = f'user-{cred.username}'
+                break
+
+        # If a privesc vector node already exists in the graph (e.g. cap_setuid
+        # found a turn earlier), let root chain through it for a complete path.
+        for node_id in self.graph.nodes:
+            if 'cap-setuid' in node_id or node_id.startswith('vuln-suid') or node_id.startswith('vuln-sudo'):
+                ctx['privesc_vector_id'] = node_id
+                break
+
+        return ctx
+
+    def _ensure_web_spine(self, name: str, url: str, args: dict) -> str | None:
+        """Ensure machine → service:port → endpoint(path) [→ file] nodes exist.
+        Returns the deepest node id, which becomes the provenance anchor."""
+        m = re.match(r'(https?)://([^/:]+)(?::(\d+))?(/[^?#\s]*)?', url)
+        if not m:
+            return None
+        scheme, host, port, path = m.groups()
+        port = port or ('443' if scheme == 'https' else '80')
+
+        svc_id = f'{host}:{port}'
+        if svc_id not in self.graph.nodes:
+            self.graph.add_node(svc_id, f'http/{port}', 'service')
+        self.graph.add_edge(self.target, svc_id, scheme)
+        deepest = svc_id
+
+        path = (path or '/').rstrip('/') or '/'
+        if path != '/':
+            ep_id = f'{host}:{port}{path}'
+            if ep_id not in self.graph.nodes:
+                self.graph.add_node(ep_id, path, 'service')
+            self.graph.add_edge(svc_id, ep_id, 'path')
+            deepest = ep_id
+
+        # download_and_analyze pulls a file off an endpoint — represent it so
+        # creds recovered from the file chain: endpoint → file → cred.
+        if name == 'download_and_analyze':
+            filename = str(args.get('filename', '') or '').strip()
+            if filename:
+                file_id = f'file-{filename}'
+                if file_id not in self.graph.nodes:
+                    self.graph.add_node(file_id, filename, 'vulnerability')
+                self.graph.add_edge(deepest, file_id, 'download')
+                deepest = file_id
+
+        return deepest
 
     def _extract_hostnames(self, output: str) -> list[str]:
         hostnames = set()
@@ -259,21 +326,41 @@ class Analyzer:
             return []
 
 
-def _parse_command_output_for_graph(output: str, target: str) -> dict:
+def _parse_command_output_for_graph(output: str, target: str, ctx: dict | None = None) -> dict:
     try:
+        ctx = ctx or {}
+        src = ctx.get('source_id') or target
+        foothold_user = ctx.get('foothold_user_id')
+        privesc_vector = ctx.get('privesc_vector_id')
         nodes, edges = [], []
+
+        # Privesc capability node — surfaced before the uid check so root can
+        # chain through it: user → cap_setuid → root.
+        cap_node = None
+        if 'cap_setuid' in output:
+            cap_node = 'vuln-cap-setuid'
+            nodes.append({'id': cap_node, 'label': 'cap_setuid', 'type': 'vulnerability'})
+            edges.append({'source': foothold_user or target, 'target': cap_node, 'label': 'capability'})
+
         for match in re.finditer(r'uid=\d+\((\w+)\)', output):
             user = match.group(1)
             if user == 'root':
                 nodes.append({'id': 'root-access', 'label': 'ROOT ACCESS', 'type': 'root'})
-                edges.append({'source': target, 'target': 'root-access', 'label': 'privesc'})
+                # Chain root through the privesc vector (cap_setuid found this
+                # turn or earlier) → foothold user → machine, in that preference.
+                root_src = cap_node or privesc_vector or foothold_user or target
+                edges.append({'source': root_src, 'target': 'root-access', 'label': 'privesc'})
             elif user != 'nobody':
+                # The user node already exists in the chain (discovered via the
+                # credential it came from), so just ensure it's present — no
+                # extra edge, which would only create a cred↔user cycle.
                 node_id = f'user-{user}'
                 nodes.append({'id': node_id, 'label': f'User: {user}', 'type': 'user'})
-                edges.append({'source': target, 'target': node_id, 'label': 'ssh'})
 
         if re.search(r'user\.txt', output) and re.search(r'[0-9a-f]{32}', output):
             nodes.append({'id': 'user-flag', 'label': 'user.txt', 'type': 'vulnerability'})
+            if foothold_user:
+                edges.append({'source': foothold_user, 'target': 'user-flag', 'label': 'flag'})
         if re.search(r'root\.txt', output) and re.search(r'[0-9a-f]{32}', output):
             nodes.append({'id': 'root-flag', 'label': 'root.txt', 'type': 'root'})
             edges.append({'source': 'root-access', 'target': 'root-flag', 'label': 'flag'})
@@ -284,7 +371,7 @@ def _parse_command_output_for_graph(output: str, target: str) -> dict:
             if user and user not in ('anonymous', 'ftp'):
                 ftp_users.append(user)
                 nodes.append({'id': f'user-{user}', 'label': f'User: {user}', 'type': 'user'})
-                edges.append({'source': target, 'target': f'user-{user}', 'label': 'cred found'})
+                edges.append({'source': src, 'target': f'user-{user}', 'label': 'cred found'})
         for index, match in enumerate(re.finditer(r'PASS\s+(\S+)', output)):
             passwd = match.group(1)
             node_id = f'cred-{passwd[:30]}'
@@ -292,11 +379,7 @@ def _parse_command_output_for_graph(output: str, target: str) -> dict:
             if index < len(ftp_users):
                 edges.append({'source': f'user-{ftp_users[index]}', 'target': node_id, 'label': 'password'})
             else:
-                edges.append({'source': target, 'target': node_id, 'label': 'credential'})
-
-        if 'cap_setuid' in output:
-            nodes.append({'id': 'vuln-cap-setuid', 'label': 'cap_setuid', 'type': 'vulnerability'})
-            edges.append({'source': target, 'target': 'vuln-cap-setuid', 'label': 'capability'})
+                edges.append({'source': src, 'target': node_id, 'label': 'credential'})
 
         return {'nodes': nodes, 'edges': edges}
     except Exception:
