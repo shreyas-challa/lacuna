@@ -153,19 +153,6 @@ def _sanitize_curl_flags(flags: str) -> str:
     return flags.strip()
 
 
-@tool(
-    name='nmap_scan',
-    description='Run an nmap scan against a target. Supports custom flags.',
-    parameters={
-        'type': 'object',
-        'properties': {
-            'target': {'type': 'string', 'description': 'Target IP or hostname'},
-            'flags': {'type': 'string', 'description': 'Additional nmap flags (e.g. "-sV -sC -T4 -p-")', 'default': '-sV -sC'},
-        },
-        'required': ['target'],
-    },
-    phases=['enumeration'],
-)
 def _extract_open_ports(output: str) -> list[str]:
     """Open TCP ports from any nmap output (works on partial/streamed output too)."""
     seen, ports = set(), []
@@ -207,6 +194,19 @@ async def _staged_nmap(target: str, full: bool = False) -> str:
     return f"[Open TCP ports: {ports}]\n\n{detail}"
 
 
+@tool(
+    name='nmap_scan',
+    description='Run an nmap scan against a target. Supports custom flags.',
+    parameters={
+        'type': 'object',
+        'properties': {
+            'target': {'type': 'string', 'description': 'Target IP or hostname'},
+            'flags': {'type': 'string', 'description': 'Additional nmap flags (e.g. "-sV -sC -T4 -p-")', 'default': '-sV -sC'},
+        },
+        'required': ['target'],
+    },
+    phases=['enumeration'],
+)
 async def nmap_scan(target: str, flags: str = '-sV -sC') -> str:
     safe_flags = _sanitize_nmap_flags(flags)
     # If the model already scoped to specific ports, honor that directly (patiently).
