@@ -26,7 +26,7 @@ from backend.analyzer import Analyzer
 from backend.graph import GraphManager
 from backend.journal import RunJournal
 from backend.operator import Operator, OperatorTaskContext
-from backend.report import ReportBuilder
+from backend.report import ReportBuilder, build_state_report
 from backend.ws_manager import WSManager
 from backend.state import StateManager
 from backend.knowledge import match_service_to_exploits
@@ -911,6 +911,7 @@ class Agent:
 
     async def run(self):
         L = self.logger
+        self._run_start = time.time()
 
         if self.lhost:
             set_lhost(self.lhost)
@@ -1405,7 +1406,21 @@ class Agent:
         L.header(f"{C_BOLD}{C_BLUE}  Log: {L.log_path}{C_RESET}")
         L.header(f"{C_BOLD}{C_BLUE}{'='*60}{C_RESET}\n")
 
-        await self.manager.broadcast('report_update', {'markdown': self.report.get_markdown()})
+        # Synthesize the deliverable report deterministically from state +
+        # graph. The Operator's voluntary append_report sections (if any) are
+        # folded in as Operator Notes — the report no longer depends on the
+        # model remembering to narrate it.
+        extra = self.report.sections[1:] if self.report.has_content else None
+        meta = {
+            'model': f"{get_active_model()} ({get_active_backend()})",
+            'iterations': self.total_iterations,
+            'tool_calls': self._tool_call_count,
+            'planner_calls': self._planner_calls,
+            'cost': self.total_cost,
+            'duration_s': time.time() - getattr(self, '_run_start', time.time()),
+        }
+        final_markdown = build_state_report(self.target, self.state, self.graph, meta, extra)
+        await self.manager.broadcast('report_update', {'markdown': final_markdown})
         await self.manager.broadcast('complete', {})
         await self.shell_sessions.close_all()
         self.journal.close()
