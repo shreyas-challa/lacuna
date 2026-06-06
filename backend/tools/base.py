@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import re
 from typing import Callable
 
@@ -20,6 +21,29 @@ def tool(name: str, description: str, parameters: dict, phases: list[str]):
         }
         return func
     return decorator
+
+
+def validate_tool_registry() -> list[str]:
+    """Catch registration bugs where @tool decorated the wrong function (e.g. a
+    helper inserted between the decorator and the intended function). Returns a
+    list of human-readable problems; empty means healthy."""
+    problems = []
+    for name, info in TOOL_REGISTRY.items():
+        fn = info['function']
+        try:
+            params = set(inspect.signature(fn).parameters)
+        except (TypeError, ValueError):
+            problems.append(f"{name}: cannot inspect registered function signature")
+            continue
+        props = set((info.get('parameters') or {}).get('properties', {}).keys())
+        # A correctly-registered tool's function must accept at least one of the
+        # parameters its JSON schema advertises. Zero overlap = wrong function.
+        if props and not (props & params):
+            problems.append(
+                f"{name}: registered function '{getattr(fn, '__name__', '?')}' takes {sorted(params)} "
+                f"but the schema declares {sorted(props)} — decorator is attached to the wrong function."
+            )
+    return problems
 
 
 def get_tools_for_phase(phase: str) -> list[dict]:
