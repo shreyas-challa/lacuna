@@ -248,6 +248,28 @@ def sanitize_tool_args(name: str, args: dict, context: dict | None = None) -> tu
     return sanitized, note
 
 
+def _privesc_checks_in_command(args: dict) -> set[str]:
+    """Credit privesc checklist items by COMMAND CONTENT, regardless of which
+    tool ran them. The model often runs `sudo -l`, `getcap`, etc. via
+    execute_command/sshpass instead of the dedicated check_* tool, which
+    otherwise leaves the checklist 'unchecked' and resurrects the same task."""
+    cmd = str(args.get('command', '') or '').lower()
+    if not cmd:
+        return set()
+    done: set[str] = set()
+    if 'sudo' in cmd and (' -l' in cmd or '--list' in cmd):
+        done.add('check_sudo')
+    if 'getcap' in cmd:
+        done.add('check_capabilities')
+    if '-perm -4000' in cmd or '-perm -u=s' in cmd or '-perm /4000' in cmd or '-perm -2000' in cmd:
+        done.add('check_suid')
+    if 'crontab' in cmd or '/etc/cron' in cmd or 'list-timers' in cmd:
+        done.add('check_cron')
+    if 'linpeas' in cmd:
+        done.update({'check_sudo', 'check_capabilities', 'check_suid', 'check_cron'})
+    return done
+
+
 def _add_tool_hint(name: str, args: dict, error_msg: str) -> str:
     hint = TOOL_HINTS.get(name, 'HINT: Try a different approach or tool. Do not repeat the same call.')
     if 'TIMEOUT' in error_msg:
@@ -380,6 +402,8 @@ class Agent:
         self._stall_recoveries: int = 0
         # Guard against the planner producing no actionable task (no-op spin)
         self._no_task_iterations: int = 0
+        # Per-task no-tool-response counter, to close tasks the operator won't act on
+        self._task_no_tool_counts: dict[str, int] = {}
 
     def _get_knowledge_hints(self) -> str:
         """Match discovered services against exploit knowledge base."""
@@ -1063,13 +1087,26 @@ class Agent:
 
                     active_task = self.memory.current_plan.ensure_single_active() if self.memory.current_plan else None
                     if active_task and active_task.status in ('active', 'pending'):
-                        active_task.status = 'blocked'
-                        self.memory.record_dead_end(
-                            f"Operator returned no tool calls while task remained open: {active_task.title}"
-                        )
-                        self.operator.mark_task_blocked(active_task.title)
+                        cnt = self._task_no_tool_counts.get(active_task.id, 0) + 1
+                        self._task_no_tool_counts[active_task.id] = cnt
+                        if cnt >= 2:
+                            # The operator insists this task is finished and won't act.
+                            # Close it as done so a DIFFERENT task activates, instead
+                            # of re-asking the same dead question forever (the privesc
+                            # "sudo -l" no-op spin).
+                            active_task.status = 'done'
+                            if 'Operator reported no further action.' not in active_task.evidence:
+                                active_task.evidence.append('Operator reported no further action.')
+                            self.memory.record_dead_end(f"Closed stuck task after {cnt} no-op responses: {active_task.title}")
+                            L.log(f"{C_YELLOW}Closing stuck task '{active_task.title}' after {cnt} no-tool responses{C_RESET}")
+                        else:
+                            active_task.status = 'blocked'
+                            self.memory.record_dead_end(
+                                f"Operator returned no tool calls while task remained open: {active_task.title}"
+                            )
+                            self.operator.mark_task_blocked(active_task.title)
+                            L.log(f"{C_CYAN}Blocked task after no-tool response: {active_task.title}{C_RESET}")
                         self._request_plan_refresh()
-                        L.log(f"{C_CYAN}Blocked task after no-tool response: {active_task.title}{C_RESET}")
                         continue
 
                     if consecutive_stops >= 2:
@@ -1227,6 +1264,8 @@ class Agent:
                         self._tool_failure_iter.pop(name, None)
                         if name in {'check_sudo', 'check_capabilities', 'check_suid', 'check_cron'}:
                             self._privesc_checks_done.add(name)
+                        # Also credit checks the model ran via execute_command/sshpass.
+                        self._privesc_checks_done |= _privesc_checks_in_command(args)
 
                     analysis = self.analyzer.analyze(name, args, result)
                     self.memory.record_observation(analysis.observation)
