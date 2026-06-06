@@ -398,6 +398,10 @@ class Agent:
         self._tracked_task_id: str = ''
         self._active_task_stall_count: int = 0
         self._planner_calls: int = 0
+        # Planner LLM throttle: only spend an LLM refine at genuine inflection
+        # points (phase change or a new high-value finding), not every iteration.
+        self._last_llm_phase: str | None = None
+        self._llm_refine_pending: bool = False
         # Bounded stall-recovery: broaden surface instead of abandoning the target
         self._stall_recoveries: int = 0
         # Guard against the planner producing no actionable task (no-op spin)
@@ -481,6 +485,18 @@ class Agent:
 
     def _request_plan_refresh(self):
         self._plan_refresh_required = True
+
+    def _should_llm_refine(self) -> bool:
+        """Whether a refresh warrants spending an LLM call. The deterministic
+        template plan handles ordinary state progress for free; the LLM is only
+        worth invoking when the situation has genuinely shifted — a new phase or
+        a new high/critical finding. This keeps planner calls to a handful per
+        engagement instead of one per iteration."""
+        if self.phase != self._last_llm_phase:
+            return True
+        if self._llm_refine_pending:
+            return True
+        return False
 
     def _phase_budget_limit(self, phase: str) -> int:
         base = PHASE_BASE_BUDGETS.get(phase, 20)
@@ -583,6 +599,20 @@ class Agent:
         if not force and not self._plan_refresh_required:
             return
 
+        # Throttle the planner LLM: when nothing warrants re-planning (no phase
+        # change, no new high-value finding), don't rebuild the plan at all —
+        # just re-sync task statuses from state, which is deterministic and
+        # free. Avoids burning an LLM refine on every iteration (the dominant
+        # cost in past runs: 9 planner calls in a 10-iteration engagement).
+        if not force and not template_only and not self._should_llm_refine():
+            if self.memory.current_plan and self.memory.current_plan.ensure_single_active():
+                self.memory.sync_from_state(self.state)
+                self._sync_plan_progress()
+                self._plan_refresh_required = False
+                self._last_state_fingerprint = self._state_fingerprint()
+                return
+
+        use_llm = not template_only and bool(self.planner.model_override)
         self.memory.sync_from_state(self.state)
         result = await self.planner.build_plan(
             self.phase,
@@ -590,6 +620,9 @@ class Agent:
             self.memory.to_snapshot(),
             force_template=template_only,
         )
+        if use_llm:
+            self._last_llm_phase = self.phase
+            self._llm_refine_pending = False
         self.memory.set_plan(result.plan, reason or result.source)
         self._sync_plan_progress()
         self._plan_refresh_required = False
@@ -1312,6 +1345,10 @@ class Agent:
                     if new_fingerprint != self._last_state_fingerprint or analysis.plan_refresh_required:
                         self._request_plan_refresh()
                         self._last_state_fingerprint = new_fingerprint
+                    # A new high/critical finding is the kind of inflection that
+                    # justifies spending an LLM refine; ordinary progress doesn't.
+                    if analysis.observation.significance in ('high', 'critical'):
+                        self._llm_refine_pending = True
                     self.journal.write('analysis', {
                         'phase': self.phase,
                         'task_id': operator_context.task_id,
