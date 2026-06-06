@@ -137,29 +137,43 @@ class Operator:
         })
 
     def _build_system_prompt(self, context: OperatorTaskContext) -> str:
+        """Lay out the system prompt STABLE-FIRST, VOLATILE-LAST.
+
+        The system message is the start of the token stream, so prefix caching
+        only reuses tokens up to the first byte that changes turn-to-turn. We
+        therefore front-load everything that is constant within a phase (role,
+        rules, phase guidance, target) and push everything that changes every
+        iteration (current task, live state, graph, budget) to the tail. Within
+        a phase this makes the whole leading block cacheable instead of just the
+        first line — past runs cached only ~1.6% of input tokens.
+        """
         phase_prompt = _load_prompt(f"{context.phase}.md")
         lhost_line = f"\nLHOST: {context.lhost}" if context.lhost else ""
+
+        # ── STABLE prefix (identical across iterations within a phase) ──
         parts = [
             "You are Lacuna's tactical operator. Your role is to advance ONE active task.",
             f"Target: {context.target}{lhost_line}",
             f"Phase: {context.phase}",
-            f"Current task: {context.task_title}",
-        ]
-        if context.task_description:
-            parts.append(f"Task detail: {context.task_description}")
-        if context.success_criteria:
-            parts.append(f"Success condition: {context.success_criteria}")
-        if context.tool_hints:
-            parts.append(f"Preferred tools: {', '.join(context.tool_hints[:5])}")
-        parts.extend([
-            "Rules:",
-            "- Stay within the active task unless transition_phase is the only correct move.",
-            "- Prefer one decisive tool call. Use multiple tool calls only if they are a tight sequence for the same task.",
-            "- If the task is blocked, return no tool calls and state the blocker briefly.",
+            "Rules:\n"
+            "- Stay within the active task unless transition_phase is the only correct move.\n"
+            "- Prefer one decisive tool call. Use multiple tool calls only if they are a tight sequence for the same task.\n"
+            "- If the task is blocked, return no tool calls and state the blocker briefly.\n"
             "- Do not invent facts outside the structured context.",
-        ])
+        ]
         if phase_prompt:
             parts.append("Phase guidance:\n" + phase_prompt)
+
+        # ── VOLATILE tail (changes every iteration; breaks cache only here) ──
+        task_lines = [f"## Current Task\n{context.task_title}"]
+        if context.task_description:
+            task_lines.append(f"Detail: {context.task_description}")
+        if context.success_criteria:
+            task_lines.append(f"Success condition: {context.success_criteria}")
+        if context.tool_hints:
+            task_lines.append(f"Preferred tools: {', '.join(context.tool_hints[:5])}")
+        parts.append("\n".join(task_lines))
+
         if context.state_summary:
             parts.append(context.state_summary)
         if context.memory_summary:
