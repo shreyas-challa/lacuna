@@ -87,6 +87,7 @@ def _sanitize_nmap_flags(flags: str) -> str:
     flags = re.sub(r'\s*-sU\b', '', flags)            # UDP: needs root + very slow
     flags = re.sub(r'\s*-sS\b', ' -sT', flags)        # SYN -> connect scan (unprivileged)
     flags = re.sub(r'\s*-s[AWMNFXO]\b', '', flags)    # ACK/Window/Maimon/raw scans need root
+    flags = re.sub(r'(?:^|\s)-O\b', ' ', flags)        # OS detection needs root
     flags = re.sub(r'\s+', ' ', flags).strip()
 
     # Collapse duplicate value-taking flags (keep first + its value) so a stray
@@ -160,22 +161,59 @@ def _sanitize_curl_flags(flags: str) -> str:
     },
     phases=['enumeration'],
 )
+def _extract_open_ports(output: str) -> list[str]:
+    """Open TCP ports from any nmap output (works on partial/streamed output too)."""
+    seen, ports = set(), []
+    for m in re.finditer(r'(\d+)/tcp\s+open', output or ''):
+        p = m.group(1)
+        if p not in seen:
+            seen.add(p)
+            ports.append(p)
+    return ports
+
+
+def _timed_out(result: str) -> bool:
+    return '[TIMEOUT after' in (result or '')
+
+
+async def _staged_nmap(target: str, full: bool = False) -> str:
+    """Robust two-stage scan for slow hosts: discover open ports fast WITHOUT
+    version probes, then run -sV -sC on just those ports. This is what a human
+    does and avoids the 'slow box -> -sV times out -> nothing found' failure."""
+    port_spec = '-p-' if full else '--top-ports 1000'
+    s1_timeout = 360 if full else 200
+    discovery = await run_command(
+        f'nmap -Pn -sT -n -T4 --min-rate 1000 --max-retries 2 {port_spec} --open {target}',
+        timeout=s1_timeout,
+    )
+    open_ports = _extract_open_ports(discovery)  # works even if discovery timed out mid-run
+    if not open_ports:
+        if _timed_out(discovery):
+            return (f"{discovery}\n\n[NOTE] Port discovery did not finish in {s1_timeout}s — the host is "
+                    f"slow/filtered. Re-run nmap_scan with a small specific port set, e.g. flags='-p 21,22,80'.")
+        return (f"{discovery}\n\n[NOTE] No open ports in the {'full' if full else 'top-1000'} range. "
+                f"Host may be heavily filtered; try specific ports if you have a hypothesis.")
+    ports = ','.join(open_ports)
+    detail = await run_command(f'nmap -Pn -sV -sC -n -T4 -p {ports} {target}', timeout=240)
+    if _timed_out(detail) or 'open' not in detail:
+        return (f"[Open TCP ports: {ports}] (service/version detection was slow)\n\n{discovery}\n\n"
+                f"[NOTE] -sV -sC stalled on this slow host; the ports above are confirmed open — "
+                f"probe them directly (curl_request, or nmap_scan with a single -p <port>).")
+    return f"[Open TCP ports: {ports}]\n\n{detail}"
+
+
 async def nmap_scan(target: str, flags: str = '-sV -sC') -> str:
     safe_flags = _sanitize_nmap_flags(flags)
-    # Be patient: a full/heavy scan is the money scan — give it room to finish
-    # rather than aborting and reporting nothing.
-    is_heavy = '-p-' in safe_flags or '--top-ports' in safe_flags or '-A' in safe_flags
-    timeout = 300 if is_heavy else 120
-    result = await run_command(f'nmap {safe_flags} {target}', timeout=timeout)
-    # Surface a clear, actionable message when nothing came back so the model
-    # adjusts instead of blindly retrying the same scan.
-    if result.startswith('[TIMEOUT'):
-        return (f"{result} — nmap did not finish in {timeout}s. Narrow the scope "
-                f"(e.g. scan specific ports with -p 21,22,80) rather than re-running a full scan.")
-    if 'open' not in result and 'Nmap scan report' in result:
-        return (f"{result}\n\n[NOTE] No open ports reported. Try '-Pn' (host may block ping) "
-                f"or a connect scan '-sT', and give it time before changing approach.")
-    return result
+    # If the model already scoped to specific ports, honor that directly (patiently).
+    explicit_ports = bool(re.search(r'-p\s*[\d,]', safe_flags)) and '-p-' not in safe_flags
+    if explicit_ports:
+        result = await run_command(f'nmap {safe_flags} {target}', timeout=300)
+        if _timed_out(result) and not _extract_open_ports(result):
+            return (f"{result}\n\n[NOTE] Scan did not finish — narrow to fewer ports or retry; "
+                    f"the host is slow, this is not necessarily a failure.")
+        return result
+    # Otherwise run the robust two-stage discovery (default and -p- scans).
+    return await _staged_nmap(target, full='-p-' in safe_flags)
 
 
 @tool(
