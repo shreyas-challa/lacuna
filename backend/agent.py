@@ -486,6 +486,35 @@ class Agent:
     def _request_plan_refresh(self):
         self._plan_refresh_required = True
 
+    def _read_fetch_key(self, name: str, args: dict) -> str | None:
+        """Normalized cache key for a side-effect-free GET fetch whose body is
+        the same regardless of which tool retrieved it. Lets curl_request and
+        (unauthenticated) web_request GETs of the same URL share one cache
+        entry, killing the redundant re-fetches seen in past runs (/data/0 ×3,
+        /capture ×2). Returns None for anything stateful (POST, cookies, auth
+        sessions, file downloads) so those always execute fresh."""
+        if name == 'curl_request':
+            flags = f" {str(args.get('flags', '') or '')} "
+            if any(t in flags for t in (' -d ', ' --data', ' -X ', ' -b ', ' --cookie',
+                                        ' -c ', ' --cookie-jar', ' -o ', ' --output', ' -F ', ' --form')):
+                return None
+            url = str(args.get('url', '') or '')
+        elif name == 'web_request':
+            if str(args.get('method', 'GET') or 'GET').upper() != 'GET':
+                return None
+            if args.get('data') or args.get('json_body'):
+                return None
+            session = self.state.web_sessions.get(str(args.get('session_name', '') or ''))
+            if session and session.authenticated:
+                return None  # authenticated GETs can be dynamic — don't dedup
+            url = str(args.get('url', '') or '')
+        else:
+            return None
+        url = url.split('#')[0]
+        if not url.startswith(('http://', 'https://')):
+            return None
+        return f"GETFETCH|{url.rstrip('/')}"
+
     def _should_llm_refine(self) -> bool:
         """Whether a refresh warrants spending an LLM call. The deterministic
         template plan handles ordinary state progress for free; the LLM is only
@@ -1233,11 +1262,21 @@ class Agent:
                     # ── Cache check ──────────────────────────────
                     cache_key = f"{name}|{json.dumps(args, sort_keys=True)}"
                     cacheable = _should_cache_tool(name, args)
+                    url_key = self._read_fetch_key(name, args)
                     repeat_count = self._stateful_call_counts.get(cache_key, 0)
                     if cacheable and cache_key in self._tool_cache:
                         result = f"[CACHED - identical call already executed] {self._tool_cache[cache_key][:3000]}"
                         tool_time = 0.0
                         L.log(f"{C_YELLOW}Cache hit: {name}{C_RESET}")
+                    elif url_key and url_key in self._tool_cache:
+                        fetched_url = url_key.split('|', 1)[1]
+                        result = (
+                            f"[ALREADY FETCHED {fetched_url} — identical GET returned below. "
+                            "Act on this content; pursue a new endpoint or lead instead of re-fetching.] "
+                            f"{self._tool_cache[url_key][:3000]}"
+                        )
+                        tool_time = 0.0
+                        L.log(f"{C_YELLOW}Fetch dedup: {name} {fetched_url}{C_RESET}")
                     elif (not cacheable and repeat_count >= 2
                           and name not in ('transition_phase', 'append_report')):
                         # Stateful calls aren't cached, so identical repeats (the 6x-POST
@@ -1290,6 +1329,11 @@ class Agent:
                         tool_time = time.time() - tool_start
                         if _should_cache_tool(name, args):
                             self._tool_cache[cache_key] = result
+                        # Share successful side-effect-free GETs across fetch
+                        # tools so the same URL isn't pulled again by a different
+                        # tool. Never cache errors/timeouts (retry must be allowed).
+                        if url_key and not result.startswith('[ERROR]') and '[TIMEOUT' not in result[:64]:
+                            self._tool_cache[url_key] = result
 
                     # Prepend advisory notes so the model sees them (without
                     # blocking the call or tripping the failure tracker).
