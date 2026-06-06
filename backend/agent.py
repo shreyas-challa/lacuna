@@ -31,7 +31,7 @@ from backend.ws_manager import WSManager
 from backend.state import StateManager
 from backend.knowledge import match_service_to_exploits
 from backend.output_processing import OutputProcessor
-from backend.planning import Planner, WorkingMemory
+from backend.planning import Planner, WorkingMemory, PlanTask
 from backend.shell_sessions import ShellSessionManager, parse_sshpass_ssh_command
 from backend.tools import TOOL_REGISTRY, get_tools_for_phase
 from backend.tools.exploitation import set_lhost
@@ -554,6 +554,28 @@ class Agent:
             plan.set_status('collect-root-flag', 'active', evidence='Root access confirmed')
         if 'root_flag' in self.state.loot:
             plan.set_status('collect-root-flag', 'done', evidence='Root flag collected')
+
+        # Never strand the operator. State progress (e.g. capturing a web session)
+        # can close the last open task; if that happens before we have a foothold,
+        # keep one enumeration task live so the operator keeps exploring (FTP,
+        # deeper web, the IDOR/pcap path) instead of the run completing at iter ~6.
+        if not self.state.has_root(self.target) and not any(
+            task.status in ('active', 'pending') for task in plan.tasks
+        ):
+            fallback = plan.get_task('fallback-enum')
+            if fallback:
+                fallback.status = 'active'
+            else:
+                plan.tasks.append(PlanTask(
+                    id='fallback-enum',
+                    title='Enumerate remaining surfaces in depth',
+                    description='Earlier tasks are done but there is no foothold yet — pursue untried surfaces.',
+                    status='active',
+                    priority=10,
+                    tool_hints=['curl_request', 'gobuster_dir', 'ffuf_fuzz',
+                                'download_and_analyze', 'execute_command', 'query_kb'],
+                    success_criteria='Find a credential, foothold, or a new attack surface.',
+                ))
 
         plan.ensure_single_active()
 
