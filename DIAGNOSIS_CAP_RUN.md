@@ -1,5 +1,10 @@
 # Cap Run Diagnosis — 2026-06-05 (log `20260605_205533_10_129_15_120`)
 
+> **STATUS (2026-06-06): all items resolved.** C1, H2, M3, M4, M5, L8 fixed and
+> pushed. L7 was a false alarm (significance *is* logged, just nested under
+> `payload.observation.significance`). L6 (FTP probes) left as-is — harmless
+> exploration. See per-item "✅ Fixed" notes below. Re-run Cap to confirm.
+
 **Outcome:** SUCCESS. Rooted Cap end-to-end in 10 iterations / 19 tool calls / 9 planner calls.
 user_flag `2b4162c3…` and root_flag `84decb30…` both captured. Cost $0.1477, 136,653 in / 27,770 out tokens.
 
@@ -11,7 +16,7 @@ The path-finding works. The problems below are about **reporting, the graph, and
 
 ## CRITICAL
 
-### C1 — Pentest report is empty (only the title)
+### C1 — Pentest report is empty (only the title)  ✅ Fixed (commit cd24606)
 - **Symptom:** report contains just `# Penetration Test Report: 10.129.15.120`, nothing else.
 - **Root cause:** the report is built *only* when the model voluntarily calls the `append_report` meta-tool (`backend/agent.py:1535`, `backend/report.py`). Across this run — and the two prior Cap runs — `append_report` was called **0 times**.
 - **Why the model skips it:** the prompts both ask for it *and* tell it to bail the instant it roots:
@@ -25,7 +30,7 @@ The path-finding works. The problems below are about **reporting, the graph, and
 
 ## HIGH (user-flagged)
 
-### H2 — Attack graph is a star, not a chain (no provenance)
+### H2 — Attack graph is a star, not a chain (no provenance)  ✅ Fixed (commit 4d444bd)
 - **Symptom:** the `nathan` credential node links **directly to the machine node**, not to the HTTP service / pcap that produced it. Everything radiates from the machine, which defeats the point of the graph.
 - **Root cause:** **every parser hardcodes `source: target`** (the machine) for its edges:
   - `backend/parsers.py` — `parse_nmap:28`, `parse_gobuster:45`, `parse_ffuf:72`, `parse_nuclei:89`, `parse_pcap_analysis:120/128/132`, `parse_hydra:169`, etc.
@@ -43,15 +48,15 @@ The path-finding works. The problems below are about **reporting, the graph, and
 
 ## MEDIUM (cost / efficiency)
 
-### M3 — Planner LLM ran 9 of 10 iterations (main cost driver)
+### M3 — Planner LLM ran 9 of 10 iterations (main cost driver)  ✅ Fixed (commit 1ed575d)
 - `_refresh_plan` (`backend/agent.py:582`) fires whenever `_plan_refresh_required` is set, which nearly every state change / high-significance / web-asset event sets (15+ `_request_plan_refresh()` call sites). No dedup, no throttle.
 - **This is the pending Tier-2 work.** Throttle LLM refine to (a) phase changes and (b) genuinely new high-significance findings, with a state-fingerprint guard so identical state doesn't re-refine. Fall back to the template plan otherwise. Likely cuts planner token spend by more than half.
 
-### M4 — Cache hit rate is 1.6% (2,166 of 136,653 input tokens)
+### M4 — Cache hit rate is 1.6% (2,166 of 136,653 input tokens)  ✅ Fixed (commit 877d6cb)
 - Almost no prefix caching. The prompt prefix changes every turn (state summary / graph / memory injected near the top), so the cached-input price (`$0.15` vs `$0.60`) almost never applies.
 - **Fix direction:** restructure prompts so the **stable** content (system prompt, tool schemas, target) is a fixed prefix and the **volatile** content (state, graph, recent observations) comes last. With MiniMax/OpenAI-style prefix caching this is most of the input cost.
 
-### M5 — Redundant re-fetches of the same resource
+### M5 — Redundant re-fetches of the same resource  ✅ Fixed (commit 8db2ca5)
 - `/data/0` fetched **3×**, `/capture` **2×**, `/download/0` **2×**, across `web_request`, `curl_request`, and `download_and_analyze`.
 - The repeat-guard (`_stateful_call_counts`, `backend/agent.py:362`) only blocks *identical* calls to *stateful* tools — it doesn't dedup the **same URL across different fetch tools**, and plain GETs may not count as stateful.
 - **Fix direction:** a small per-URL fetch cache keyed by normalized URL (regardless of which fetch tool), returning the cached body with a note instead of re-hitting the target. Also collapses the overlapping roles of `curl_request -o` vs `download_and_analyze` (see L8).
@@ -61,8 +66,8 @@ The path-finding works. The problems below are about **reporting, the graph, and
 ## LOW / observations
 
 - **L6 — FTP dead-ends:** anonymous FTP probe (`curl ftp://…anonymous`) and later `ftp://nathan:…@` were tried though FTP isn't the path. Harmless exploration, ~2 wasted calls.
-- **L7 — `significance` not logged:** every `analysis` event in the jsonl has `significance: '?'` — the journal isn't recording the analyzer's significance value. Hurts future log-driven debugging; cheap to fix in `journal`/analysis logging.
-- **L8 — Overlapping fetch tools:** `curl_request` (with `-o`), `download_and_analyze`, and raw `execute_command(curl)` all pull files. The model used two different tools to grab the same pcap. Consolidating fetch responsibility would reduce confusion and redundancy (ties into M5).
+- **L7 — `significance` not logged:** ✅ FALSE ALARM — every `analysis` event in the jsonl has `significance: '?'` — the journal isn't recording the analyzer's significance value. Hurts future log-driven debugging; cheap to fix in `journal`/analysis logging.
+- **L8 — Overlapping fetch tools:** ✅ Fixed (commit a77663c) — `curl_request` (with `-o`), `download_and_analyze`, and raw `execute_command(curl)` all pull files. The model used two different tools to grab the same pcap. Consolidating fetch responsibility would reduce confusion and redundancy (ties into M5).
 
 ---
 
